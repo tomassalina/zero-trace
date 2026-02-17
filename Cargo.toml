@@ -3,6 +3,7 @@ resolver = "2"
 version = "0.1.2"
 members = [
   "contracts/mock-game-hub",
+  "contracts/mock-zk-verifier",
   "contracts/twenty-one",
   "contracts/number-guess",
   "contracts/dice-duel",

@@ -1,0 +1,6 @@
+[package]
+name = "shot_verification"
+type = "bin"
+authors = ["Zero Trace"]
+
+[dependencies]

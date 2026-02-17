@@ -1,0 +1,6 @@
+[package]
+name = "move_validation"
+type = "bin"
+authors = ["Zero Trace"]
+
+[dependencies]

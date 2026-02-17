@@ -1,91 +1,30 @@
 import { create } from 'zustand';
 
 export interface WalletState {
-  // Wallet connection
   publicKey: string | null;
-  walletId: string | null; // ID of the connected wallet
-  walletType: 'dev' | 'wallet' | null; // Track if dev wallet or real wallet
   isConnected: boolean;
-  isConnecting: boolean;
-
-  // Network info
-  network: string | null;
-  networkPassphrase: string | null;
-
-  // Error handling
+  balance: string | null;
   error: string | null;
 
-  // Actions
-  setWallet: (publicKey: string, walletId: string, walletType: 'dev' | 'wallet') => void;
-  setPublicKey: (publicKey: string) => void;
-  setConnected: (connected: boolean) => void;
-  setConnecting: (connecting: boolean) => void;
-  setNetwork: (network: string, networkPassphrase: string) => void;
+  setWallet: (publicKey: string) => void;
+  setBalance: (balance: string | null) => void;
   setError: (error: string | null) => void;
   disconnect: () => void;
-  reset: () => void;
 }
 
-const initialState = {
-  publicKey: null,
-  walletId: null,
-  walletType: null,
-  isConnected: false,
-  isConnecting: false,
-  network: null,
-  networkPassphrase: null,
-  error: null,
-};
-
 export const useWalletStore = create<WalletState>()((set) => ({
-  ...initialState,
+  publicKey: null,
+  isConnected: false,
+  balance: null,
+  error: null,
 
-  setWallet: (publicKey, walletId, walletType) =>
-    set({
-      publicKey,
-      walletId,
-      walletType,
-      isConnected: true,
-      isConnecting: false,
-      error: null,
-    }),
+  setWallet: (publicKey) =>
+    set({ publicKey, isConnected: true, error: null }),
 
-  setPublicKey: (publicKey) =>
-    set({
-      publicKey,
-      isConnected: true,
-      isConnecting: false,
-      error: null,
-    }),
+  setBalance: (balance) => set({ balance }),
 
-  setConnected: (connected) =>
-    set({
-      isConnected: connected,
-      isConnecting: false,
-    }),
-
-  setConnecting: (connecting) =>
-    set({
-      isConnecting: connecting,
-      error: null,
-    }),
-
-  setNetwork: (network, networkPassphrase) =>
-    set({
-      network,
-      networkPassphrase,
-    }),
-
-  setError: (error) =>
-    set({
-      error,
-      isConnecting: false,
-    }),
+  setError: (error) => set({ error }),
 
   disconnect: () =>
-    set({
-      ...initialState,
-    }),
-
-  reset: () => set(initialState),
+    set({ publicKey: null, isConnected: false, balance: null, error: null }),
 }));

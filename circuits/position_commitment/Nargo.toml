@@ -1,0 +1,6 @@
+[package]
+name = "position_commitment"
+type = "bin"
+authors = ["Zero Trace"]
+
+[dependencies]

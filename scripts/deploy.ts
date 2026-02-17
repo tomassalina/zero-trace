@@ -130,7 +130,9 @@ if (!mock) {
   process.exit(1);
 }
 
-const needsMock = contracts.some((c) => !c.isMockHub);
+const mockVerifier = allContracts.find((c) => c.packageName === "mock-zk-verifier");
+
+const needsMock = contracts.some((c) => !c.isMockHub && c.packageName !== "mock-zk-verifier");
 const deployMockRequested = contracts.some((c) => c.isMockHub);
 const shouldEnsureMock = deployMockRequested || needsMock;
 
@@ -288,8 +290,37 @@ if (shouldEnsureMock) {
   }
 }
 
+// Deploy mock-zk-verifier if zero-trace is being deployed
+let mockVerifierId = existingContractIds["mock-zk-verifier"] || "";
+const needsVerifier = contracts.some((c) => c.packageName === "zero-trace");
+if (needsVerifier && mockVerifier) {
+  if (mockVerifierId && await testnetContractExists(mockVerifierId)) {
+    deployed["mock-zk-verifier"] = mockVerifierId;
+    console.log(`✅ Using existing mock-zk-verifier on testnet: ${mockVerifierId}\n`);
+  } else {
+    if (!await Bun.file(mockVerifier.wasmPath).exists()) {
+      console.error("❌ Error: Missing WASM build output for mock-zk-verifier:");
+      console.error(`  - ${mockVerifier.wasmPath}`);
+      console.error("\nRun 'bun run build mock-zk-verifier' first");
+      process.exit(1);
+    }
+
+    console.log(`Deploying mock-zk-verifier...`);
+    try {
+      const result =
+        await $`stellar contract deploy --wasm ${mockVerifier.wasmPath} --source-account ${adminSecret} --network ${NETWORK}`.text();
+      mockVerifierId = result.trim();
+      deployed["mock-zk-verifier"] = mockVerifierId;
+      console.log(`✅ mock-zk-verifier deployed: ${mockVerifierId}\n`);
+    } catch (error) {
+      console.error(`❌ Failed to deploy mock-zk-verifier:`, error);
+      process.exit(1);
+    }
+  }
+}
+
 for (const contract of contracts) {
-  if (contract.isMockHub) continue;
+  if (contract.isMockHub || contract.packageName === "mock-zk-verifier") continue;
 
   console.log(`Deploying ${contract.packageName}...`);
   try {
@@ -300,8 +331,15 @@ for (const contract of contracts) {
     console.log(`  WASM hash: ${wasmHash}`);
 
     console.log("  Deploying and initializing...");
-    const deployResult =
-      await $`stellar contract deploy --wasm-hash ${wasmHash} --source-account ${adminSecret} --network ${NETWORK} -- --admin ${adminAddress} --game-hub ${mockGameHubId}`.text();
+    let deployResult: string;
+    if (contract.packageName === "zero-trace") {
+      // zero-trace constructor takes 3 args: admin, game_hub, verifier
+      deployResult =
+        await $`stellar contract deploy --wasm-hash ${wasmHash} --source-account ${adminSecret} --network ${NETWORK} -- --admin ${adminAddress} --game-hub ${mockGameHubId} --verifier ${mockVerifierId}`.text();
+    } else {
+      deployResult =
+        await $`stellar contract deploy --wasm-hash ${wasmHash} --source-account ${adminSecret} --network ${NETWORK} -- --admin ${adminAddress} --game-hub ${mockGameHubId}`.text();
+    }
     const contractId = deployResult.trim();
     deployed[contract.packageName] = contractId;
     console.log(`✅ ${contract.packageName} deployed: ${contractId}\n`);
