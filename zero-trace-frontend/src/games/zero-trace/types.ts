@@ -2,8 +2,10 @@ export type GamePhase = 'lobby' | 'setup' | 'playing' | 'finished';
 
 export type CellState = 'empty' | 'blocked' | 'miss' | 'hit' | 'your-position' | 'move-target';
 
-export type AppScreen = 'home' | 'play' | 'profile';
-export type PlayScreen = 'menu' | 'create' | 'waiting' | 'join-private' | 'room-list' | 'setup' | 'playing' | 'finished';
+/** Determines if an incoming shot hit our private position */
+export function deriveHitResult(myPos: PrivateState, shot: { x: number; y: number }): boolean {
+  return myPos.x === shot.x && myPos.y === shot.y;
+}
 
 export interface Position {
   x: number;

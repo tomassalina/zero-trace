@@ -2,24 +2,28 @@
 
 //! # Zero Trace — ZK Battleship on Stellar
 //!
-//! A two-player hide-and-seek game on a 6×6 grid. Each player IS a single hidden
-//! unit. Players commit positions with ZK proofs (Noir + UltraHonk), fire at each
-//! other's cells, and prove hits/misses without ever revealing their location.
+//! A two-player hide-and-seek game on a 6x6 grid with **simultaneous turns**.
+//! Both players commit positions with ZK proofs, fire at the same time, and
+//! prove hits/misses without revealing their location.
+//!
+//! **Game Flow:**
+//! 1. Setup: Both commit positions (3 min timeout, else cancel & refund)
+//! 2. Firing: Both fire simultaneously (3 min timeout)
+//! 3. Responding: Both prove hit/miss + move (3 min timeout)
+//! 4. Repeat until someone is hit (or both hit → draw, or 36 rounds → draw)
 //!
 //! **Room System:**
-//! - Public rooms: listed and joinable by anyone
-//! - Private rooms: password-protected, share room ID + password to invite
+//! - Public rooms: listed and joinable by anyone (10 min expiry)
+//! - Private rooms: password-protected via keccak256 hash
+//! - Each player can only be in one active game/room at a time
 //!
-//! **ZK Mechanics:**
-//! - Position commitment: Poseidon hash of (x, y, salt), verified on-chain
-//! - Shot verification: Target proves hit/miss without revealing position
-//! - Move validation: Player proves they moved to a valid adjacent cell
-//!
-//! **Game Hub Integration:**
-//! Calls `start_game` and `end_game` on the Game Hub contract.
+//! **Escrow:**
+//! - Stakes are transferred to the contract on create_room/join_room
+//! - Winner gets 90% of the pot, 10% protocol fee to admin
+//! - Draw/cancel: full refund to both players
 
 use soroban_sdk::{
-    contract, contractclient, contracterror, contractimpl, contracttype,
+    contract, contractclient, contracterror, contractimpl, contracttype, token,
     vec, Address, Bytes, BytesN, Env, IntoVal, Vec,
 };
 
@@ -72,6 +76,9 @@ pub enum Error {
     RoomAlreadyExists = 15,
     WrongPassword = 16,
     NotCreator = 17,
+    AlreadyFired = 18,
+    AlreadyResponded = 19,
+    AlreadyInGame = 20,
 }
 
 // ============================================================================
@@ -83,8 +90,8 @@ pub enum Error {
 #[repr(u32)]
 pub enum GamePhase {
     Setup = 0,
-    Playing = 1,
-    WaitingResponse = 2,
+    Firing = 1,
+    Responding = 2,
     Finished = 3,
 }
 
@@ -95,24 +102,32 @@ pub struct Game {
     pub player2: Address,
     pub player1_points: i128,
     pub player2_points: i128,
+    // ZK commitments
     pub player1_commitment: BytesN<32>,
     pub player2_commitment: BytesN<32>,
     pub player1_committed: bool,
     pub player2_committed: bool,
-    pub current_turn: u32,
-    pub turn_number: u32,
+    // Simultaneous shots
+    pub player1_shot_x: u32,
+    pub player1_shot_y: u32,
+    pub player2_shot_x: u32,
+    pub player2_shot_y: u32,
+    pub player1_has_shot: bool,
+    pub player2_has_shot: bool,
+    // Simultaneous responses
+    pub player1_responded: bool,
+    pub player2_responded: bool,
+    pub player1_was_hit: bool,
+    pub player2_was_hit: bool,
+    // Round tracking
+    pub round_number: u32,
     pub blocked_x: Vec<u32>,
     pub blocked_y: Vec<u32>,
+    // Timing & state
     pub last_action_ledger: u32,
     pub phase: GamePhase,
     pub winner: Option<Address>,
-    pub last_shot_x: u32,
-    pub last_shot_y: u32,
-    pub has_last_shot: bool,
-    pub last_shot_hit: u32, // 0=none, 1=miss, 2=hit
-    pub player1_alive: bool,
-    pub player2_alive: bool,
-    pub pending_equalizer: bool,
+    pub is_draw: bool,
 }
 
 #[contracttype]
@@ -121,7 +136,7 @@ pub struct PendingRoom {
     pub creator: Address,
     pub stake: i128,
     pub is_public: bool,
-    pub password_hash: BytesN<32>, // keccak256; zeroes = no password
+    pub password_hash: BytesN<32>,
     pub created_ledger: u32,
 }
 
@@ -134,18 +149,24 @@ pub enum DataKey {
     GameHubAddress,
     Admin,
     VerifierAddress,
+    NativeToken,
     PositionVk,
     ShotVk,
     MoveVk,
+    ActiveGame(Address),
 }
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-const GAME_TTL_LEDGERS: u32 = 518_400; // 30 days
-const TIMEOUT_LEDGERS: u32 = 24;       // ~2 minutes (5s per ledger)
+const GAME_TTL_LEDGERS: u32 = 518_400;     // 30 days
+const ROOM_TIMEOUT_LEDGERS: u32 = 120;     // 10 min (public room expiry)
+const SETUP_TIMEOUT_LEDGERS: u32 = 36;     // 3 min (both must commit)
+const ACTION_TIMEOUT_LEDGERS: u32 = 36;    // 3 min (fire/respond deadline)
 const GRID_SIZE: u32 = 6;
+const MAX_ROUNDS: u32 = 36;                // Draw if both survive this many rounds
+const PROTOCOL_FEE_BPS: i128 = 1000;       // 10% protocol fee (1000/10000)
 
 // ============================================================================
 // Contract
@@ -156,23 +177,21 @@ pub struct ZeroTraceContract;
 
 #[contractimpl]
 impl ZeroTraceContract {
-    /// Initialize with admin, game hub, and ZK verifier addresses.
-    pub fn __constructor(env: Env, admin: Address, game_hub: Address, verifier: Address) {
+    /// Initialize with admin, game hub, ZK verifier, and native token addresses.
+    pub fn __constructor(env: Env, admin: Address, game_hub: Address, verifier: Address, native_token: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::GameHubAddress, &game_hub);
         env.storage().instance().set(&DataKey::VerifierAddress, &verifier);
+        env.storage().instance().set(&DataKey::NativeToken, &native_token);
     }
 
     // ========================================================================
-    // Admin: Store verification keys (as raw JSON bytes for UltraHonk)
+    // Admin: Store verification keys
     // ========================================================================
 
-    /// Store a verification key for a circuit type.
-    /// circuit_type: 0 = position, 1 = shot, 2 = move
     pub fn set_vk(env: Env, circuit_type: u32, vk: Bytes) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("no admin");
         admin.require_auth();
-
         let key = match circuit_type {
             0 => DataKey::PositionVk,
             1 => DataKey::ShotVk,
@@ -183,10 +202,98 @@ impl ZeroTraceContract {
     }
 
     // ========================================================================
+    // Active Game Tracking
+    // ========================================================================
+
+    /// Get a player's active game session ID. Returns None if not in a game.
+    pub fn get_active_game(env: Env, player: Address) -> Option<u32> {
+        let key = DataKey::ActiveGame(player);
+        env.storage().temporary().get(&key)
+    }
+
+    fn set_active_game(env: &Env, player: &Address, session_id: u32) {
+        let key = DataKey::ActiveGame(player.clone());
+        env.storage().temporary().set(&key, &session_id);
+        env.storage().temporary().extend_ttl(&key, GAME_TTL_LEDGERS, GAME_TTL_LEDGERS);
+    }
+
+    fn clear_active_game(env: &Env, player: &Address) {
+        let key = DataKey::ActiveGame(player.clone());
+        if env.storage().temporary().has(&key) {
+            env.storage().temporary().remove(&key);
+        }
+    }
+
+    fn require_no_active_game(env: &Env, player: &Address) -> Result<(), Error> {
+        let key = DataKey::ActiveGame(player.clone());
+        if let Some(sid) = env.storage().temporary().get::<DataKey, u32>(&key) {
+            // Check if there's an active game (not finished)
+            let game_key = DataKey::Game(sid);
+            if let Some(game) = env.storage().temporary().get::<DataKey, Game>(&game_key) {
+                if game.phase != GamePhase::Finished {
+                    return Err(Error::AlreadyInGame);
+                }
+            } else {
+                // No game yet — check if there's a pending room
+                let room_key = DataKey::PendingRoom(sid);
+                if env.storage().temporary().has(&room_key) {
+                    return Err(Error::AlreadyInGame);
+                }
+            }
+            // Game finished and room gone — clear stale reference
+            env.storage().temporary().remove(&key);
+        }
+        Ok(())
+    }
+
+    // ========================================================================
+    // Token Helpers
+    // ========================================================================
+
+    fn get_token<'a>(env: &'a Env) -> token::Client<'a> {
+        let addr: Address = env.storage().instance().get(&DataKey::NativeToken).expect("no token");
+        token::Client::new(env, &addr)
+    }
+
+    fn get_admin_addr(env: &Env) -> Address {
+        env.storage().instance().get(&DataKey::Admin).expect("no admin")
+    }
+
+    /// Transfer stake from player to contract (escrow deposit)
+    fn collect_stake(env: &Env, from: &Address, amount: i128) {
+        let xlm = Self::get_token(env);
+        xlm.transfer(from, &env.current_contract_address(), &amount);
+    }
+
+    /// Refund stake from contract to player
+    fn refund_stake(env: &Env, to: &Address, amount: i128) {
+        let xlm = Self::get_token(env);
+        xlm.transfer(&env.current_contract_address(), to, &amount);
+    }
+
+    /// Pay winner: 90% of pot to winner, 10% fee to admin
+    fn pay_winner_from_pot(env: &Env, winner: &Address, total_pot: i128) {
+        let fee = total_pot * PROTOCOL_FEE_BPS / 10_000;
+        let prize = total_pot - fee;
+        let xlm = Self::get_token(env);
+        xlm.transfer(&env.current_contract_address(), winner, &prize);
+        if fee > 0 {
+            let admin = Self::get_admin_addr(env);
+            xlm.transfer(&env.current_contract_address(), &admin, &fee);
+        }
+    }
+
+    /// Refund both players their full stakes
+    fn refund_both_players(env: &Env, game: &Game) {
+        let xlm = Self::get_token(env);
+        xlm.transfer(&env.current_contract_address(), &game.player1, &game.player1_points);
+        xlm.transfer(&env.current_contract_address(), &game.player2, &game.player2_points);
+    }
+
+    // ========================================================================
     // Room System
     // ========================================================================
 
-    /// Create a pending room. Only the creator signs.
     pub fn create_room(
         env: Env,
         session_id: u32,
@@ -197,12 +304,17 @@ impl ZeroTraceContract {
     ) -> Result<(), Error> {
         creator.require_auth();
 
-        // Reject if room or game already exists
+        // Check player isn't already in a game or room
+        Self::require_no_active_game(&env, &creator)?;
+
         let room_key = DataKey::PendingRoom(session_id);
         let game_key = DataKey::Game(session_id);
         if env.storage().temporary().has(&room_key) || env.storage().temporary().has(&game_key) {
             return Err(Error::RoomAlreadyExists);
         }
+
+        // Collect stake from creator into escrow
+        Self::collect_stake(&env, &creator, stake);
 
         let room = PendingRoom {
             creator: creator.clone(),
@@ -215,7 +327,9 @@ impl ZeroTraceContract {
         env.storage().temporary().set(&room_key, &room);
         env.storage().temporary().extend_ttl(&room_key, GAME_TTL_LEDGERS, GAME_TTL_LEDGERS);
 
-        // Add to public room index if public
+        // Track active game for creator (room counts as active)
+        Self::set_active_game(&env, &creator, session_id);
+
         if is_public {
             let idx_key = DataKey::PublicRoomIndex;
             let mut index: Vec<u32> = env.storage().persistent().get(&idx_key).unwrap_or(Vec::new(&env));
@@ -227,8 +341,6 @@ impl ZeroTraceContract {
         Ok(())
     }
 
-    /// Join a pending room. Verifies password for private rooms.
-    /// Creates the full Game and calls Game Hub start_game.
     pub fn join_room(
         env: Env,
         session_id: u32,
@@ -237,10 +349,20 @@ impl ZeroTraceContract {
     ) -> Result<(), Error> {
         joiner.require_auth();
 
+        // Check joiner isn't already in a game
+        Self::require_no_active_game(&env, &joiner)?;
+
         let room_key = DataKey::PendingRoom(session_id);
         let room: PendingRoom = env.storage().temporary().get(&room_key).ok_or(Error::RoomNotFound)?;
 
-        // Reject self-play
+        // Check room expiry (10 min)
+        // Note: refund happens via cancel_room or list_public_rooms pruning,
+        // not here — returning Err rolls back all state changes including refunds.
+        let elapsed = env.ledger().sequence() - room.created_ledger;
+        if elapsed > ROOM_TIMEOUT_LEDGERS {
+            return Err(Error::RoomNotFound);
+        }
+
         if joiner == room.creator {
             return Err(Error::SelfPlay);
         }
@@ -255,7 +377,10 @@ impl ZeroTraceContract {
             }
         }
 
-        // Call Game Hub start_game
+        // Collect stake from joiner into escrow
+        Self::collect_stake(&env, &joiner, room.stake);
+
+        // Call Game Hub
         let hub_addr: Address = env.storage().instance().get(&DataKey::GameHubAddress).expect("no hub");
         let hub = GameHubClient::new(&env, &hub_addr);
         hub.start_game(
@@ -267,40 +392,17 @@ impl ZeroTraceContract {
             &room.stake,
         );
 
-        // Create the game
-        let game = Game {
-            player1: room.creator.clone(),
-            player2: joiner.clone(),
-            player1_points: room.stake,
-            player2_points: room.stake,
-            player1_commitment: BytesN::from_array(&env, &[0u8; 32]),
-            player2_commitment: BytesN::from_array(&env, &[0u8; 32]),
-            player1_committed: false,
-            player2_committed: false,
-            current_turn: 1,
-            turn_number: 0,
-            blocked_x: Vec::new(&env),
-            blocked_y: Vec::new(&env),
-            last_action_ledger: env.ledger().sequence(),
-            phase: GamePhase::Setup,
-            winner: None,
-            last_shot_x: 0,
-            last_shot_y: 0,
-            has_last_shot: false,
-            last_shot_hit: 0,
-            player1_alive: true,
-            player2_alive: true,
-            pending_equalizer: false,
-        };
+        let game = Self::new_game(&env, room.creator.clone(), joiner.clone(), room.stake, room.stake);
 
         let game_key = DataKey::Game(session_id);
         env.storage().temporary().set(&game_key, &game);
         env.storage().temporary().extend_ttl(&game_key, GAME_TTL_LEDGERS, GAME_TTL_LEDGERS);
 
+        // Track active game for joiner (creator already tracked)
+        Self::set_active_game(&env, &joiner, session_id);
+
         // Remove pending room
         env.storage().temporary().remove(&room_key);
-
-        // Remove from public index if public
         if room.is_public {
             Self::remove_from_public_index(&env, session_id);
         }
@@ -308,34 +410,37 @@ impl ZeroTraceContract {
         Ok(())
     }
 
-    /// Read a pending room (no auth required).
     pub fn get_room(env: Env, session_id: u32) -> Result<PendingRoom, Error> {
         let room_key = DataKey::PendingRoom(session_id);
         env.storage().temporary().get(&room_key).ok_or(Error::RoomNotFound)
     }
 
-    /// List active public room IDs. Prunes expired rooms.
     pub fn list_public_rooms(env: Env) -> Vec<u32> {
         let idx_key = DataKey::PublicRoomIndex;
         let index: Vec<u32> = env.storage().persistent().get(&idx_key).unwrap_or(Vec::new(&env));
 
-        // Prune rooms that no longer exist (expired or joined)
         let mut pruned = Vec::new(&env);
+        let current_ledger = env.ledger().sequence();
         for id in index.iter() {
             let room_key = DataKey::PendingRoom(id);
-            if env.storage().temporary().has(&room_key) {
-                pruned.push_back(id);
+            if let Some(room) = env.storage().temporary().get::<DataKey, PendingRoom>(&room_key) {
+                if current_ledger - room.created_ledger <= ROOM_TIMEOUT_LEDGERS {
+                    pruned.push_back(id);
+                } else {
+                    // Expired — refund creator and clean up
+                    Self::refund_stake(&env, &room.creator, room.stake);
+                    env.storage().temporary().remove(&room_key);
+                    Self::clear_active_game(&env, &room.creator);
+                }
             }
         }
 
-        // Write back pruned index if it changed
         env.storage().persistent().set(&idx_key, &pruned);
         env.storage().persistent().extend_ttl(&idx_key, GAME_TTL_LEDGERS, GAME_TTL_LEDGERS);
 
         pruned
     }
 
-    /// Cancel a pending room. Only the creator can cancel.
     pub fn cancel_room(env: Env, session_id: u32, creator: Address) -> Result<(), Error> {
         creator.require_auth();
 
@@ -346,8 +451,11 @@ impl ZeroTraceContract {
             return Err(Error::NotCreator);
         }
 
-        env.storage().temporary().remove(&room_key);
+        // Refund creator's stake
+        Self::refund_stake(&env, &creator, room.stake);
 
+        env.storage().temporary().remove(&room_key);
+        Self::clear_active_game(&env, &creator);
         if room.is_public {
             Self::remove_from_public_index(&env, session_id);
         }
@@ -356,10 +464,10 @@ impl ZeroTraceContract {
     }
 
     // ========================================================================
-    // Game Lifecycle (kept for backward compat with tests)
+    // Game Lifecycle
     // ========================================================================
 
-    /// Create a new game session. Both players must authorize their stakes.
+    /// Create a new game session directly (for tests / backward compat).
     pub fn create_game(
         env: Env,
         session_id: u32,
@@ -383,7 +491,10 @@ impl ZeroTraceContract {
             player2_points.into_val(&env),
         ]);
 
-        // Call Game Hub start_game
+        // Collect stakes from both players
+        Self::collect_stake(&env, &player1, player1_points);
+        Self::collect_stake(&env, &player2, player2_points);
+
         let hub_addr: Address = env.storage().instance().get(&DataKey::GameHubAddress).expect("no hub");
         let hub = GameHubClient::new(&env, &hub_addr);
         hub.start_game(
@@ -395,39 +506,20 @@ impl ZeroTraceContract {
             &player2_points,
         );
 
-        let game = Game {
-            player1: player1.clone(),
-            player2: player2.clone(),
-            player1_points,
-            player2_points,
-            player1_commitment: BytesN::from_array(&env, &[0u8; 32]),
-            player2_commitment: BytesN::from_array(&env, &[0u8; 32]),
-            player1_committed: false,
-            player2_committed: false,
-            current_turn: 1,
-            turn_number: 0,
-            blocked_x: Vec::new(&env),
-            blocked_y: Vec::new(&env),
-            last_action_ledger: env.ledger().sequence(),
-            phase: GamePhase::Setup,
-            winner: None,
-            last_shot_x: 0,
-            last_shot_y: 0,
-            has_last_shot: false,
-            last_shot_hit: 0,
-            player1_alive: true,
-            player2_alive: true,
-            pending_equalizer: false,
-        };
+        let game = Self::new_game(&env, player1.clone(), player2.clone(), player1_points, player2_points);
 
         let key = DataKey::Game(session_id);
         env.storage().temporary().set(&key, &game);
         env.storage().temporary().extend_ttl(&key, GAME_TTL_LEDGERS, GAME_TTL_LEDGERS);
 
+        // Track active games
+        Self::set_active_game(&env, &player1, session_id);
+        Self::set_active_game(&env, &player2, session_id);
+
         Ok(())
     }
 
-    /// Commit initial position with ZK proof.
+    /// Commit initial position with ZK proof. Both players call independently.
     pub fn commit_position(
         env: Env,
         session_id: u32,
@@ -445,7 +537,6 @@ impl ZeroTraceContract {
             return Err(Error::InvalidPhase);
         }
 
-        // Verify ZK proof for position commitment
         Self::verify_zk_proof(&env, &DataKey::PositionVk, &proof, &public_inputs)?;
 
         if player == game.player1 {
@@ -464,10 +555,9 @@ impl ZeroTraceContract {
             return Err(Error::NotPlayer);
         }
 
-        // If both committed, transition to Playing
+        // Both committed → transition to Firing
         if game.player1_committed && game.player2_committed {
-            game.phase = GamePhase::Playing;
-            game.current_turn = 1; // Player 1 always goes first
+            game.phase = GamePhase::Firing;
         }
 
         game.last_action_ledger = env.ledger().sequence();
@@ -477,7 +567,8 @@ impl ZeroTraceContract {
         Ok(())
     }
 
-    /// Fire a shot at a target cell. Only the active player can fire.
+    /// Fire a shot. Both players fire independently during Firing phase.
+    /// When both have fired, transitions to Responding.
     pub fn fire(
         env: Env,
         session_id: u32,
@@ -490,40 +581,45 @@ impl ZeroTraceContract {
         let key = DataKey::Game(session_id);
         let mut game: Game = env.storage().temporary().get(&key).ok_or(Error::GameNotFound)?;
 
-        if game.phase != GamePhase::Playing {
+        if game.phase != GamePhase::Firing {
             return Err(Error::InvalidPhase);
         }
         if game.winner.is_some() {
             return Err(Error::GameAlreadyEnded);
         }
 
-        // Check it's this player's turn
+        if target_x >= GRID_SIZE || target_y >= GRID_SIZE {
+            return Err(Error::InvalidCoordinate);
+        }
+
         let is_p1 = player == game.player1;
         let is_p2 = player == game.player2;
         if !is_p1 && !is_p2 {
             return Err(Error::NotPlayer);
         }
-        let player_num = if is_p1 { 1u32 } else { 2u32 };
-        if game.current_turn != player_num {
-            return Err(Error::NotYourTurn);
+
+        if is_p1 {
+            if game.player1_has_shot {
+                return Err(Error::AlreadyFired);
+            }
+            game.player1_shot_x = target_x;
+            game.player1_shot_y = target_y;
+            game.player1_has_shot = true;
+        } else {
+            if game.player2_has_shot {
+                return Err(Error::AlreadyFired);
+            }
+            game.player2_shot_x = target_x;
+            game.player2_shot_y = target_y;
+            game.player2_has_shot = true;
         }
 
-        // Validate coordinates
-        if target_x >= GRID_SIZE || target_y >= GRID_SIZE {
-            return Err(Error::InvalidCoordinate);
-        }
-
-        // Store the shot and transition to WaitingResponse
-        game.last_shot_x = target_x;
-        game.last_shot_y = target_y;
-        game.has_last_shot = true;
-        game.last_shot_hit = 0; // pending
-        game.phase = GamePhase::WaitingResponse;
         game.last_action_ledger = env.ledger().sequence();
 
-        // Add to blocked cells
-        game.blocked_x.push_back(target_x);
-        game.blocked_y.push_back(target_y);
+        // Both fired → transition to Responding
+        if game.player1_has_shot && game.player2_has_shot {
+            game.phase = GamePhase::Responding;
+        }
 
         env.storage().temporary().set(&key, &game);
         env.storage().temporary().extend_ttl(&key, GAME_TTL_LEDGERS, GAME_TTL_LEDGERS);
@@ -531,12 +627,13 @@ impl ZeroTraceContract {
         Ok(())
     }
 
-    /// Target player responds to a shot: proves hit/miss AND moves to new position.
+    /// Respond to the round: prove hit/miss and submit new position.
+    /// Both players call independently. When both respond, round resolves.
     pub fn respond(
         env: Env,
         session_id: u32,
         player: Address,
-        hit: bool,
+        was_hit: bool,
         new_commitment: BytesN<32>,
         shot_proof: Bytes,
         shot_public_inputs: Bytes,
@@ -548,98 +645,52 @@ impl ZeroTraceContract {
         let key = DataKey::Game(session_id);
         let mut game: Game = env.storage().temporary().get(&key).ok_or(Error::GameNotFound)?;
 
-        if game.phase != GamePhase::WaitingResponse {
-            return Err(Error::NoShotToRespond);
+        if game.phase != GamePhase::Responding {
+            return Err(Error::InvalidPhase);
         }
         if game.winner.is_some() {
             return Err(Error::GameAlreadyEnded);
         }
 
-        // The responder is the opponent of whoever fired
         let is_p1 = player == game.player1;
         let is_p2 = player == game.player2;
         if !is_p1 && !is_p2 {
             return Err(Error::NotPlayer);
         }
 
-        // The responder must be the one who was shot at (NOT the current_turn player)
-        let expected_responder = if game.current_turn == 1 { 2u32 } else { 1u32 };
-        let responder_num = if is_p1 { 1u32 } else { 2u32 };
-        if responder_num != expected_responder {
-            return Err(Error::NotYourTurn);
+        if is_p1 {
+            if game.player1_responded {
+                return Err(Error::AlreadyResponded);
+            }
+        } else {
+            if game.player2_responded {
+                return Err(Error::AlreadyResponded);
+            }
         }
 
-        // Verify shot proof (proves hit/miss is truthful)
+        // Verify shot proof
         Self::verify_zk_proof(&env, &DataKey::ShotVk, &shot_proof, &shot_public_inputs)?;
 
-        // Verify move proof (proves new position is valid adjacent move)
-        Self::verify_zk_proof(&env, &DataKey::MoveVk, &move_proof, &move_public_inputs)?;
-
-        // Update commitment to new position
-        if is_p1 {
-            game.player1_commitment = new_commitment;
-        } else {
-            game.player2_commitment = new_commitment;
+        // If not hit, verify move proof
+        if !was_hit {
+            Self::verify_zk_proof(&env, &DataKey::MoveVk, &move_proof, &move_public_inputs)?;
         }
 
-        game.last_shot_hit = if hit { 2 } else { 1 };
+        if is_p1 {
+            game.player1_commitment = new_commitment;
+            game.player1_was_hit = was_hit;
+            game.player1_responded = true;
+        } else {
+            game.player2_commitment = new_commitment;
+            game.player2_was_hit = was_hit;
+            game.player2_responded = true;
+        }
+
         game.last_action_ledger = env.ledger().sequence();
 
-        if hit {
-            // Mark the target as hit
-            if is_p1 {
-                game.player1_alive = false;
-            } else {
-                game.player2_alive = false;
-            }
-
-            if !game.pending_equalizer {
-                // First hit of the game — give opponent one equalizer shot
-                game.pending_equalizer = true;
-                let opponent_turn = if game.current_turn == 1 { 2u32 } else { 1u32 };
-                game.current_turn = opponent_turn;
-                game.phase = GamePhase::Playing;
-            } else {
-                // Equalizer phase: someone hit back — the equalizer shooter wins
-                let equalizer_shooter = game.current_turn;
-                let final_winner = if equalizer_shooter == 1 {
-                    game.player1.clone()
-                } else {
-                    game.player2.clone()
-                };
-
-                game.winner = Some(final_winner.clone());
-                game.phase = GamePhase::Finished;
-
-                let hub_addr: Address = env.storage().instance().get(&DataKey::GameHubAddress).expect("no hub");
-                let hub = GameHubClient::new(&env, &hub_addr);
-                let player1_won = final_winner == game.player1;
-                hub.end_game(&session_id, &player1_won);
-            }
-        } else {
-            // Miss — continue game
-            game.turn_number += 1;
-
-            if game.pending_equalizer {
-                // Equalizer shot missed — the original shooter wins
-                let original_shooter = if game.current_turn == 1 { 2u32 } else { 1u32 };
-                let winner = if original_shooter == 1 {
-                    game.player1.clone()
-                } else {
-                    game.player2.clone()
-                };
-                game.winner = Some(winner.clone());
-                game.phase = GamePhase::Finished;
-
-                let hub_addr: Address = env.storage().instance().get(&DataKey::GameHubAddress).expect("no hub");
-                let hub = GameHubClient::new(&env, &hub_addr);
-                let player1_won = winner == game.player1;
-                hub.end_game(&session_id, &player1_won);
-            } else {
-                // Normal turn progression: switch to the other player
-                game.current_turn = if game.current_turn == 1 { 2 } else { 1 };
-                game.phase = GamePhase::Playing;
-            }
+        // Both responded → resolve the round
+        if game.player1_responded && game.player2_responded {
+            Self::resolve_round(&env, &mut game, session_id);
         }
 
         env.storage().temporary().set(&key, &game);
@@ -648,7 +699,7 @@ impl ZeroTraceContract {
         Ok(())
     }
 
-    /// Claim victory by timeout. If opponent hasn't acted in ~2 minutes, caller wins.
+    /// Claim timeout win. Phase-aware: caller must have acted, opponent must not have.
     pub fn claim_timeout(
         env: Env,
         session_id: u32,
@@ -659,7 +710,7 @@ impl ZeroTraceContract {
         let key = DataKey::Game(session_id);
         let mut game: Game = env.storage().temporary().get(&key).ok_or(Error::GameNotFound)?;
 
-        if game.winner.is_some() {
+        if game.winner.is_some() || game.phase == GamePhase::Finished {
             return Err(Error::GameAlreadyEnded);
         }
 
@@ -670,25 +721,67 @@ impl ZeroTraceContract {
         }
 
         let elapsed = env.ledger().sequence() - game.last_action_ledger;
-        if elapsed < TIMEOUT_LEDGERS {
-            return Err(Error::TimedOut); // Not timed out yet
+
+        match game.phase {
+            GamePhase::Setup => {
+                if elapsed < SETUP_TIMEOUT_LEDGERS {
+                    return Err(Error::TimedOut);
+                }
+                // Setup timeout = cancel/draw, refund both
+                game.is_draw = true;
+                game.phase = GamePhase::Finished;
+                Self::refund_both_players(&env, &game);
+                Self::clear_active_game(&env, &game.player1);
+                Self::clear_active_game(&env, &game.player2);
+            }
+            GamePhase::Firing => {
+                if elapsed < ACTION_TIMEOUT_LEDGERS {
+                    return Err(Error::TimedOut);
+                }
+                let caller_fired = if is_p1 { game.player1_has_shot } else { game.player2_has_shot };
+                if !caller_fired {
+                    return Err(Error::InvalidPhase);
+                }
+                game.winner = Some(player.clone());
+                game.phase = GamePhase::Finished;
+                // Winner gets pot minus fee
+                let total_pot = game.player1_points + game.player2_points;
+                Self::pay_winner_from_pot(&env, &player, total_pot);
+                let hub_addr: Address = env.storage().instance().get(&DataKey::GameHubAddress).expect("no hub");
+                let hub = GameHubClient::new(&env, &hub_addr);
+                hub.end_game(&session_id, &is_p1);
+                Self::clear_active_game(&env, &game.player1);
+                Self::clear_active_game(&env, &game.player2);
+            }
+            GamePhase::Responding => {
+                if elapsed < ACTION_TIMEOUT_LEDGERS {
+                    return Err(Error::TimedOut);
+                }
+                let caller_responded = if is_p1 { game.player1_responded } else { game.player2_responded };
+                if !caller_responded {
+                    return Err(Error::InvalidPhase);
+                }
+                game.winner = Some(player.clone());
+                game.phase = GamePhase::Finished;
+                // Winner gets pot minus fee
+                let total_pot = game.player1_points + game.player2_points;
+                Self::pay_winner_from_pot(&env, &player, total_pot);
+                let hub_addr: Address = env.storage().instance().get(&DataKey::GameHubAddress).expect("no hub");
+                let hub = GameHubClient::new(&env, &hub_addr);
+                hub.end_game(&session_id, &is_p1);
+                Self::clear_active_game(&env, &game.player1);
+                Self::clear_active_game(&env, &game.player2);
+            }
+            GamePhase::Finished => {
+                return Err(Error::GameAlreadyEnded);
+            }
         }
 
-        // The player claiming timeout wins
-        let winner = player.clone();
-        game.winner = Some(winner.clone());
-        game.phase = GamePhase::Finished;
-
-        // Call Game Hub
-        let hub_addr: Address = env.storage().instance().get(&DataKey::GameHubAddress).expect("no hub");
-        let hub = GameHubClient::new(&env, &hub_addr);
-        let player1_won = winner == game.player1;
-        hub.end_game(&session_id, &player1_won);
-
+        let result = player.clone();
         env.storage().temporary().set(&key, &game);
         env.storage().temporary().extend_ttl(&key, GAME_TTL_LEDGERS, GAME_TTL_LEDGERS);
 
-        Ok(winner)
+        Ok(result)
     }
 
     /// Read game state.
@@ -741,17 +834,110 @@ impl ZeroTraceContract {
     // Internal Helpers
     // ========================================================================
 
+    fn new_game(env: &Env, player1: Address, player2: Address, p1_points: i128, p2_points: i128) -> Game {
+        Game {
+            player1,
+            player2,
+            player1_points: p1_points,
+            player2_points: p2_points,
+            player1_commitment: BytesN::from_array(env, &[0u8; 32]),
+            player2_commitment: BytesN::from_array(env, &[0u8; 32]),
+            player1_committed: false,
+            player2_committed: false,
+            player1_shot_x: 0,
+            player1_shot_y: 0,
+            player2_shot_x: 0,
+            player2_shot_y: 0,
+            player1_has_shot: false,
+            player2_has_shot: false,
+            player1_responded: false,
+            player2_responded: false,
+            player1_was_hit: false,
+            player2_was_hit: false,
+            round_number: 0,
+            blocked_x: Vec::new(env),
+            blocked_y: Vec::new(env),
+            last_action_ledger: env.ledger().sequence(),
+            phase: GamePhase::Setup,
+            winner: None,
+            is_draw: false,
+        }
+    }
+
+    fn resolve_round(env: &Env, game: &mut Game, session_id: u32) {
+        let total_pot = game.player1_points + game.player2_points;
+
+        match (game.player1_was_hit, game.player2_was_hit) {
+            (true, true) => {
+                // Draw — both hit simultaneously, refund
+                game.is_draw = true;
+                game.phase = GamePhase::Finished;
+                Self::refund_both_players(env, game);
+                Self::clear_active_game(env, &game.player1);
+                Self::clear_active_game(env, &game.player2);
+            }
+            (true, false) => {
+                // P1 was hit → P2 wins
+                game.winner = Some(game.player2.clone());
+                game.phase = GamePhase::Finished;
+                Self::pay_winner_from_pot(env, &game.player2, total_pot);
+                let hub_addr: Address = env.storage().instance().get(&DataKey::GameHubAddress).expect("no hub");
+                let hub = GameHubClient::new(env, &hub_addr);
+                hub.end_game(&session_id, &false);
+                Self::clear_active_game(env, &game.player1);
+                Self::clear_active_game(env, &game.player2);
+            }
+            (false, true) => {
+                // P2 was hit → P1 wins
+                game.winner = Some(game.player1.clone());
+                game.phase = GamePhase::Finished;
+                Self::pay_winner_from_pot(env, &game.player1, total_pot);
+                let hub_addr: Address = env.storage().instance().get(&DataKey::GameHubAddress).expect("no hub");
+                let hub = GameHubClient::new(env, &hub_addr);
+                hub.end_game(&session_id, &true);
+                Self::clear_active_game(env, &game.player1);
+                Self::clear_active_game(env, &game.player2);
+            }
+            (false, false) => {
+                // Neither hit — add shots to blocked, next round
+                game.blocked_x.push_back(game.player1_shot_x);
+                game.blocked_y.push_back(game.player1_shot_y);
+                game.blocked_x.push_back(game.player2_shot_x);
+                game.blocked_y.push_back(game.player2_shot_y);
+
+                // Reset round state
+                game.player1_has_shot = false;
+                game.player2_has_shot = false;
+                game.player1_responded = false;
+                game.player2_responded = false;
+                game.player1_was_hit = false;
+                game.player2_was_hit = false;
+                game.round_number += 1;
+
+                // Max rounds reached → draw
+                if game.round_number >= MAX_ROUNDS {
+                    game.is_draw = true;
+                    game.phase = GamePhase::Finished;
+                    Self::refund_both_players(env, game);
+                    Self::clear_active_game(env, &game.player1);
+                    Self::clear_active_game(env, &game.player2);
+                } else {
+                    game.phase = GamePhase::Firing;
+                }
+            }
+        }
+    }
+
     fn verify_zk_proof(
         env: &Env,
         vk_key: &DataKey,
         proof: &Bytes,
         public_inputs: &Bytes,
     ) -> Result<(), Error> {
-        // Skip verification if VK is not set (development / testnet mode)
         let vk_opt: Option<Bytes> = env.storage().instance().get(vk_key);
         let vk_json = match vk_opt {
             Some(vk) => vk,
-            None => return Ok(()), // No VK stored — skip verification
+            None => return Ok(()), // No VK stored — skip verification (dev mode)
         };
 
         let verifier_addr: Address = env
@@ -760,7 +946,6 @@ impl ZeroTraceContract {
             .get(&DataKey::VerifierAddress)
             .expect("no verifier");
 
-        // Pack proof_blob: [4-byte count][public_inputs][proof]
         let mut proof_blob = Bytes::new(env);
         let num_pubs = public_inputs.len() / 32;
         proof_blob.append(&Bytes::from_slice(env, &(num_pubs as u32).to_be_bytes()));

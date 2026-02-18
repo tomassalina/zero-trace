@@ -2,7 +2,7 @@
 
 use crate::{Error, GamePhase, ZeroTraceContract, ZeroTraceContractClient};
 use soroban_sdk::testutils::{Address as _, Ledger as _};
-use soroban_sdk::{contract, contractimpl, Address, Bytes, BytesN, Env};
+use soroban_sdk::{contract, contractimpl, token, Address, Bytes, BytesN, Env};
 
 // ============================================================================
 // Mocks
@@ -27,11 +27,7 @@ pub struct MockVerifier;
 
 #[contractimpl]
 impl MockVerifier {
-    pub fn verify_proof(
-        _env: Env,
-        _vk_json: Bytes,
-        _proof_blob: Bytes,
-    ) -> BytesN<32> {
+    pub fn verify_proof(_env: Env, _vk_json: Bytes, _proof_blob: Bytes) -> BytesN<32> {
         BytesN::from_array(&_env, &[0u8; 32])
     }
 }
@@ -40,12 +36,19 @@ impl MockVerifier {
 // Helpers
 // ============================================================================
 
-fn setup_test() -> (
-    Env,
-    ZeroTraceContractClient<'static>,
-    Address,
-    Address,
-) {
+struct TestEnv {
+    env: Env,
+    client: ZeroTraceContractClient<'static>,
+    admin: Address,
+    player1: Address,
+    player2: Address,
+    token_addr: Address,
+}
+
+const INITIAL_BALANCE: i128 = 1_000_0000000; // 1000 XLM in stroops
+const STAKE: i128 = 50_0000000; // 50 XLM
+
+fn setup_test() -> TestEnv {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -64,19 +67,32 @@ fn setup_test() -> (
     let verifier_addr = env.register(MockVerifier, ());
     let admin = Address::generate(&env);
 
-    let contract_id = env.register(ZeroTraceContract, (&admin, &hub_addr, &verifier_addr));
+    // Create native token (SAC)
+    let token_admin = Address::generate(&env);
+    let token_addr = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let sac_client = token::StellarAssetClient::new(&env, &token_addr);
+    let token_client = token::Client::new(&env, &token_addr);
+
+    let contract_id = env.register(ZeroTraceContract, (&admin, &hub_addr, &verifier_addr, &token_addr));
     let client = ZeroTraceContractClient::new(&env, &contract_id);
 
-    // Store dummy VKs for all 3 circuit types (as raw Bytes for UltraHonk)
     let dummy_vk = Bytes::from_slice(&env, b"[\"0x01\"]");
-    client.set_vk(&0, &dummy_vk); // position
-    client.set_vk(&1, &dummy_vk); // shot
-    client.set_vk(&2, &dummy_vk); // move
+    client.set_vk(&0, &dummy_vk);
+    client.set_vk(&1, &dummy_vk);
+    client.set_vk(&2, &dummy_vk);
 
     let player1 = Address::generate(&env);
     let player2 = Address::generate(&env);
 
-    (env, client, player1, player2)
+    // Fund players
+    sac_client.mint(&player1, &INITIAL_BALANCE);
+    sac_client.mint(&player2, &INITIAL_BALANCE);
+
+    // Verify initial balances
+    assert_eq!(token_client.balance(&player1), INITIAL_BALANCE);
+    assert_eq!(token_client.balance(&player2), INITIAL_BALANCE);
+
+    TestEnv { env, client, admin, player1, player2, token_addr }
 }
 
 fn dummy_proof(env: &Env) -> Bytes {
@@ -93,6 +109,15 @@ fn zero_hash(env: &Env) -> BytesN<32> {
     BytesN::from_array(env, &[0u8; 32])
 }
 
+fn token_balance(env: &Env, token_addr: &Address, who: &Address) -> i128 {
+    token::Client::new(env, token_addr).balance(who)
+}
+
+fn contract_balance(t: &TestEnv) -> i128 {
+    let contract_addr = t.client.address.clone();
+    token_balance(&t.env, &t.token_addr, &contract_addr)
+}
+
 fn assert_error<T, E>(
     result: &Result<Result<T, E>, Result<Error, soroban_sdk::InvokeError>>,
     expected: Error,
@@ -103,32 +128,57 @@ fn assert_error<T, E>(
     }
 }
 
+/// Helper: create game and commit both positions, returns game in Firing phase
+fn setup_firing_phase(t: &TestEnv, session_id: u32) {
+    t.client.create_game(&session_id, &t.player1, &t.player2, &STAKE, &STAKE);
+    let proof = dummy_proof(&t.env);
+    let pubs = dummy_proof(&t.env);
+    t.client.commit_position(&session_id, &t.player1, &dummy_commitment(&t.env, 1), &proof, &pubs);
+    t.client.commit_position(&session_id, &t.player2, &dummy_commitment(&t.env, 2), &proof, &pubs);
+}
+
+fn set_ledger(env: &Env, seq: u32) {
+    env.ledger().set(soroban_sdk::testutils::LedgerInfo {
+        timestamp: 1441065600 + (seq as u64),
+        protocol_version: 25,
+        sequence_number: seq,
+        network_id: Default::default(),
+        base_reserve: 10,
+        min_temp_entry_ttl: u32::MAX / 2,
+        min_persistent_entry_ttl: u32::MAX / 2,
+        max_entry_ttl: u32::MAX / 2,
+    });
+}
+
 // ============================================================================
 // Game Creation Tests
 // ============================================================================
 
 #[test]
 fn test_create_game() {
-    let (_env, client, player1, player2) = setup_test();
-    let session_id = 1u32;
-    let points = 500_0000000i128;
+    let t = setup_test();
+    t.client.create_game(&1, &t.player1, &t.player2, &STAKE, &STAKE);
 
-    client.create_game(&session_id, &player1, &player2, &points, &points);
-
-    let game = client.get_game(&session_id);
-    assert_eq!(game.player1, player1);
-    assert_eq!(game.player2, player2);
-    assert_eq!(game.player1_points, points);
+    let game = t.client.get_game(&1);
+    assert_eq!(game.player1, t.player1);
+    assert_eq!(game.player2, t.player2);
     assert_eq!(game.phase, GamePhase::Setup);
     assert!(game.winner.is_none());
     assert!(!game.player1_committed);
     assert!(!game.player2_committed);
+    assert!(!game.is_draw);
+
+    // Both players should have lost their stake
+    assert_eq!(token_balance(&t.env, &t.token_addr, &t.player1), INITIAL_BALANCE - STAKE);
+    assert_eq!(token_balance(&t.env, &t.token_addr, &t.player2), INITIAL_BALANCE - STAKE);
+    // Contract holds both stakes
+    assert_eq!(contract_balance(&t), STAKE * 2);
 }
 
 #[test]
 fn test_self_play_rejected() {
-    let (_env, client, player1, _player2) = setup_test();
-    let result = client.try_create_game(&1, &player1, &player1, &100, &100);
+    let t = setup_test();
+    let result = t.client.try_create_game(&1, &t.player1, &t.player1, &STAKE, &STAKE);
     assert_error(&result, Error::SelfPlay);
 }
 
@@ -138,213 +188,249 @@ fn test_self_play_rejected() {
 
 #[test]
 fn test_commit_positions() {
-    let (env, client, player1, player2) = setup_test();
-    let session_id = 2u32;
-    client.create_game(&session_id, &player1, &player2, &100, &100);
+    let t = setup_test();
+    t.client.create_game(&2, &t.player1, &t.player2, &STAKE, &STAKE);
 
-    let c1 = dummy_commitment(&env, 1);
-    let c2 = dummy_commitment(&env, 2);
-    let proof = dummy_proof(&env);
-    let pubs = dummy_proof(&env);
+    let proof = dummy_proof(&t.env);
+    let pubs = dummy_proof(&t.env);
 
-    // P1 commits
-    client.commit_position(&session_id, &player1, &c1, &proof, &pubs);
-    let game = client.get_game(&session_id);
+    t.client.commit_position(&2, &t.player1, &dummy_commitment(&t.env, 1), &proof, &pubs);
+    let game = t.client.get_game(&2);
     assert!(game.player1_committed);
     assert!(!game.player2_committed);
     assert_eq!(game.phase, GamePhase::Setup);
 
-    // P2 commits -> transitions to Playing
-    client.commit_position(&session_id, &player2, &c2, &proof, &pubs);
-    let game = client.get_game(&session_id);
+    t.client.commit_position(&2, &t.player2, &dummy_commitment(&t.env, 2), &proof, &pubs);
+    let game = t.client.get_game(&2);
     assert!(game.player2_committed);
-    assert_eq!(game.phase, GamePhase::Playing);
-    assert_eq!(game.current_turn, 1);
+    assert_eq!(game.phase, GamePhase::Firing);
 }
 
 #[test]
 fn test_cannot_commit_twice() {
-    let (env, client, player1, player2) = setup_test();
-    let session_id = 3u32;
-    client.create_game(&session_id, &player1, &player2, &100, &100);
+    let t = setup_test();
+    t.client.create_game(&3, &t.player1, &t.player2, &STAKE, &STAKE);
 
-    let c1 = dummy_commitment(&env, 1);
-    let proof = dummy_proof(&env);
-    let pubs = dummy_proof(&env);
+    let c1 = dummy_commitment(&t.env, 1);
+    let proof = dummy_proof(&t.env);
+    let pubs = dummy_proof(&t.env);
 
-    client.commit_position(&session_id, &player1, &c1, &proof, &pubs);
-    let result = client.try_commit_position(&session_id, &player1, &c1, &proof, &pubs);
+    t.client.commit_position(&3, &t.player1, &c1, &proof, &pubs);
+    let result = t.client.try_commit_position(&3, &t.player1, &c1, &proof, &pubs);
     assert_error(&result, Error::AlreadyCommitted);
 }
 
 #[test]
 fn test_non_player_cannot_commit() {
-    let (env, client, player1, player2) = setup_test();
-    let non_player = Address::generate(&env);
-    let session_id = 4u32;
-    client.create_game(&session_id, &player1, &player2, &100, &100);
+    let t = setup_test();
+    let non_player = Address::generate(&t.env);
+    t.client.create_game(&4, &t.player1, &t.player2, &STAKE, &STAKE);
 
-    let c = dummy_commitment(&env, 1);
-    let proof = dummy_proof(&env);
-    let pubs = dummy_proof(&env);
-
-    let result = client.try_commit_position(&session_id, &non_player, &c, &proof, &pubs);
+    let result = t.client.try_commit_position(&4, &non_player, &dummy_commitment(&t.env, 1), &dummy_proof(&t.env), &dummy_proof(&t.env));
     assert_error(&result, Error::NotPlayer);
 }
 
 // ============================================================================
-// Fire Tests
+// Simultaneous Fire Tests
 // ============================================================================
 
 #[test]
-fn test_fire_shot() {
-    let (env, client, player1, player2) = setup_test();
-    let session_id = 5u32;
-    client.create_game(&session_id, &player1, &player2, &100, &100);
+fn test_both_players_fire_simultaneously() {
+    let t = setup_test();
+    setup_firing_phase(&t, 5);
 
-    let proof = dummy_proof(&env);
-    let pubs = dummy_proof(&env);
-    client.commit_position(&session_id, &player1, &dummy_commitment(&env, 1), &proof, &pubs);
-    client.commit_position(&session_id, &player2, &dummy_commitment(&env, 2), &proof, &pubs);
+    // P1 fires — still in Firing (waiting for P2)
+    t.client.fire(&5, &t.player1, &3, &4);
+    let game = t.client.get_game(&5);
+    assert_eq!(game.phase, GamePhase::Firing);
+    assert!(game.player1_has_shot);
+    assert!(!game.player2_has_shot);
+    assert_eq!(game.player1_shot_x, 3);
+    assert_eq!(game.player1_shot_y, 4);
 
-    // P1 fires
-    client.fire(&session_id, &player1, &3, &4);
-    let game = client.get_game(&session_id);
-    assert_eq!(game.phase, GamePhase::WaitingResponse);
-    assert!(game.has_last_shot);
-    assert_eq!(game.last_shot_x, 3);
-    assert_eq!(game.last_shot_y, 4);
-    assert_eq!(game.blocked_x.len(), 1);
+    // P2 fires — transitions to Responding
+    t.client.fire(&5, &t.player2, &1, &2);
+    let game = t.client.get_game(&5);
+    assert_eq!(game.phase, GamePhase::Responding);
+    assert!(game.player1_has_shot);
+    assert!(game.player2_has_shot);
+    assert_eq!(game.player2_shot_x, 1);
+    assert_eq!(game.player2_shot_y, 2);
 }
 
 #[test]
-fn test_wrong_turn_cannot_fire() {
-    let (env, client, player1, player2) = setup_test();
-    let session_id = 6u32;
-    client.create_game(&session_id, &player1, &player2, &100, &100);
+fn test_cannot_fire_twice_same_round() {
+    let t = setup_test();
+    setup_firing_phase(&t, 6);
 
-    let proof = dummy_proof(&env);
-    let pubs = dummy_proof(&env);
-    client.commit_position(&session_id, &player1, &dummy_commitment(&env, 1), &proof, &pubs);
-    client.commit_position(&session_id, &player2, &dummy_commitment(&env, 2), &proof, &pubs);
+    t.client.fire(&6, &t.player1, &0, &0);
+    let result = t.client.try_fire(&6, &t.player1, &1, &1);
+    assert_error(&result, Error::AlreadyFired);
+}
 
-    let result = client.try_fire(&session_id, &player2, &0, &0);
-    assert_error(&result, Error::NotYourTurn);
+#[test]
+fn test_cannot_fire_in_setup_phase() {
+    let t = setup_test();
+    t.client.create_game(&7, &t.player1, &t.player2, &STAKE, &STAKE);
+
+    let result = t.client.try_fire(&7, &t.player1, &0, &0);
+    assert_error(&result, Error::InvalidPhase);
 }
 
 #[test]
 fn test_invalid_coordinate() {
-    let (env, client, player1, player2) = setup_test();
-    let session_id = 7u32;
-    client.create_game(&session_id, &player1, &player2, &100, &100);
+    let t = setup_test();
+    setup_firing_phase(&t, 8);
 
-    let proof = dummy_proof(&env);
-    let pubs = dummy_proof(&env);
-    client.commit_position(&session_id, &player1, &dummy_commitment(&env, 1), &proof, &pubs);
-    client.commit_position(&session_id, &player2, &dummy_commitment(&env, 2), &proof, &pubs);
-
-    let result = client.try_fire(&session_id, &player1, &6, &0);
+    let result = t.client.try_fire(&8, &t.player1, &6, &0);
     assert_error(&result, Error::InvalidCoordinate);
 }
 
 // ============================================================================
-// Respond (Shot Verification + Move) Tests
+// Simultaneous Respond Tests
 // ============================================================================
 
 #[test]
-fn test_respond_miss() {
-    let (env, client, player1, player2) = setup_test();
-    let session_id = 8u32;
-    client.create_game(&session_id, &player1, &player2, &100, &100);
+fn test_both_miss_next_round() {
+    let t = setup_test();
+    setup_firing_phase(&t, 10);
 
-    let proof = dummy_proof(&env);
-    let pubs = dummy_proof(&env);
-    client.commit_position(&session_id, &player1, &dummy_commitment(&env, 1), &proof, &pubs);
-    client.commit_position(&session_id, &player2, &dummy_commitment(&env, 2), &proof, &pubs);
+    let proof = dummy_proof(&t.env);
+    let pubs = dummy_proof(&t.env);
 
-    client.fire(&session_id, &player1, &0, &0);
+    // Both fire
+    t.client.fire(&10, &t.player1, &0, &0);
+    t.client.fire(&10, &t.player2, &5, &5);
 
-    let new_c = dummy_commitment(&env, 10);
-    client.respond(
-        &session_id, &player2, &false, &new_c,
-        &proof, &pubs, &proof, &pubs,
-    );
+    // P1 responds miss
+    t.client.respond(&10, &t.player1, &false, &dummy_commitment(&t.env, 10), &proof, &pubs, &proof, &pubs);
+    let game = t.client.get_game(&10);
+    assert_eq!(game.phase, GamePhase::Responding);
 
-    let game = client.get_game(&session_id);
-    assert_eq!(game.phase, GamePhase::Playing);
-    assert_eq!(game.current_turn, 2);
-    assert_eq!(game.last_shot_hit, 1);
-    assert!(game.player1_alive);
-    assert!(game.player2_alive);
+    // P2 responds miss → next round
+    t.client.respond(&10, &t.player2, &false, &dummy_commitment(&t.env, 11), &proof, &pubs, &proof, &pubs);
+    let game = t.client.get_game(&10);
+    assert_eq!(game.phase, GamePhase::Firing);
+    assert_eq!(game.round_number, 1);
+    assert_eq!(game.blocked_x.len(), 2);
+    assert!(!game.player1_has_shot);
+    assert!(!game.player2_has_shot);
+
+    // No money moved yet — still in escrow
+    assert_eq!(contract_balance(&t), STAKE * 2);
 }
 
 #[test]
-fn test_respond_hit_gives_equalizer() {
-    let (env, client, player1, player2) = setup_test();
-    let session_id = 9u32;
-    client.create_game(&session_id, &player1, &player2, &100, &100);
+fn test_p1_hit_p2_wins() {
+    let t = setup_test();
+    setup_firing_phase(&t, 11);
 
-    let proof = dummy_proof(&env);
-    let pubs = dummy_proof(&env);
-    client.commit_position(&session_id, &player1, &dummy_commitment(&env, 1), &proof, &pubs);
-    client.commit_position(&session_id, &player2, &dummy_commitment(&env, 2), &proof, &pubs);
+    let proof = dummy_proof(&t.env);
+    let pubs = dummy_proof(&t.env);
 
-    client.fire(&session_id, &player1, &3, &3);
-    let new_c = dummy_commitment(&env, 10);
-    client.respond(
-        &session_id, &player2, &true, &new_c,
-        &proof, &pubs, &proof, &pubs,
-    );
+    t.client.fire(&11, &t.player1, &0, &0);
+    t.client.fire(&11, &t.player2, &3, &3);
 
-    let game = client.get_game(&session_id);
-    assert_eq!(game.phase, GamePhase::Playing);
-    assert_eq!(game.current_turn, 2);
-    assert!(game.pending_equalizer);
-    assert!(!game.player2_alive);
-}
+    // P1 was hit by P2's shot, P2 was not hit
+    t.client.respond(&11, &t.player1, &true, &dummy_commitment(&t.env, 10), &proof, &pubs, &proof, &pubs);
+    t.client.respond(&11, &t.player2, &false, &dummy_commitment(&t.env, 11), &proof, &pubs, &proof, &pubs);
 
-#[test]
-fn test_equalizer_hit_p2_wins() {
-    let (env, client, player1, player2) = setup_test();
-    let session_id = 10u32;
-    client.create_game(&session_id, &player1, &player2, &100, &100);
-
-    let proof = dummy_proof(&env);
-    let pubs = dummy_proof(&env);
-    client.commit_position(&session_id, &player1, &dummy_commitment(&env, 1), &proof, &pubs);
-    client.commit_position(&session_id, &player2, &dummy_commitment(&env, 2), &proof, &pubs);
-
-    client.fire(&session_id, &player1, &3, &3);
-    client.respond(&session_id, &player2, &true, &dummy_commitment(&env, 10), &proof, &pubs, &proof, &pubs);
-
-    client.fire(&session_id, &player2, &1, &1);
-    client.respond(&session_id, &player1, &true, &dummy_commitment(&env, 20), &proof, &pubs, &proof, &pubs);
-
-    let game = client.get_game(&session_id);
+    let game = t.client.get_game(&11);
     assert_eq!(game.phase, GamePhase::Finished);
-    assert_eq!(game.winner, Some(player2));
+    assert_eq!(game.winner, Some(t.player2.clone()));
+    assert!(!game.is_draw);
+
+    // P2 (winner) gets 90% of pot, admin gets 10%
+    let total_pot = STAKE * 2;
+    let fee = total_pot / 10; // 10%
+    let prize = total_pot - fee;
+    assert_eq!(token_balance(&t.env, &t.token_addr, &t.player2), INITIAL_BALANCE - STAKE + prize);
+    assert_eq!(token_balance(&t.env, &t.token_addr, &t.admin), fee);
+    // P1 lost their stake
+    assert_eq!(token_balance(&t.env, &t.token_addr, &t.player1), INITIAL_BALANCE - STAKE);
+    // Contract balance should be 0
+    assert_eq!(contract_balance(&t), 0);
 }
 
 #[test]
-fn test_equalizer_miss_p1_wins() {
-    let (env, client, player1, player2) = setup_test();
-    let session_id = 11u32;
-    client.create_game(&session_id, &player1, &player2, &100, &100);
+fn test_p2_hit_p1_wins() {
+    let t = setup_test();
+    setup_firing_phase(&t, 12);
 
-    let proof = dummy_proof(&env);
-    let pubs = dummy_proof(&env);
-    client.commit_position(&session_id, &player1, &dummy_commitment(&env, 1), &proof, &pubs);
-    client.commit_position(&session_id, &player2, &dummy_commitment(&env, 2), &proof, &pubs);
+    let proof = dummy_proof(&t.env);
+    let pubs = dummy_proof(&t.env);
 
-    client.fire(&session_id, &player1, &3, &3);
-    client.respond(&session_id, &player2, &true, &dummy_commitment(&env, 10), &proof, &pubs, &proof, &pubs);
+    t.client.fire(&12, &t.player1, &3, &3);
+    t.client.fire(&12, &t.player2, &0, &0);
 
-    client.fire(&session_id, &player2, &5, &5);
-    client.respond(&session_id, &player1, &false, &dummy_commitment(&env, 20), &proof, &pubs, &proof, &pubs);
+    // P1 was not hit, P2 was hit by P1's shot
+    t.client.respond(&12, &t.player1, &false, &dummy_commitment(&t.env, 10), &proof, &pubs, &proof, &pubs);
+    t.client.respond(&12, &t.player2, &true, &dummy_commitment(&t.env, 11), &proof, &pubs, &proof, &pubs);
 
-    let game = client.get_game(&session_id);
+    let game = t.client.get_game(&12);
     assert_eq!(game.phase, GamePhase::Finished);
-    assert_eq!(game.winner, Some(player1));
+    assert_eq!(game.winner, Some(t.player1.clone()));
+
+    // P1 (winner) gets 90% of pot
+    let total_pot = STAKE * 2;
+    let fee = total_pot / 10;
+    let prize = total_pot - fee;
+    assert_eq!(token_balance(&t.env, &t.token_addr, &t.player1), INITIAL_BALANCE - STAKE + prize);
+    assert_eq!(contract_balance(&t), 0);
+}
+
+#[test]
+fn test_both_hit_is_draw() {
+    let t = setup_test();
+    setup_firing_phase(&t, 13);
+
+    let proof = dummy_proof(&t.env);
+    let pubs = dummy_proof(&t.env);
+
+    t.client.fire(&13, &t.player1, &3, &3);
+    t.client.fire(&13, &t.player2, &0, &0);
+
+    // Both were hit
+    t.client.respond(&13, &t.player1, &true, &dummy_commitment(&t.env, 10), &proof, &pubs, &proof, &pubs);
+    t.client.respond(&13, &t.player2, &true, &dummy_commitment(&t.env, 11), &proof, &pubs, &proof, &pubs);
+
+    let game = t.client.get_game(&13);
+    assert_eq!(game.phase, GamePhase::Finished);
+    assert!(game.winner.is_none());
+    assert!(game.is_draw);
+
+    // Both players get full refund
+    assert_eq!(token_balance(&t.env, &t.token_addr, &t.player1), INITIAL_BALANCE);
+    assert_eq!(token_balance(&t.env, &t.token_addr, &t.player2), INITIAL_BALANCE);
+    assert_eq!(contract_balance(&t), 0);
+}
+
+#[test]
+fn test_cannot_respond_twice() {
+    let t = setup_test();
+    setup_firing_phase(&t, 14);
+
+    let proof = dummy_proof(&t.env);
+    let pubs = dummy_proof(&t.env);
+
+    t.client.fire(&14, &t.player1, &0, &0);
+    t.client.fire(&14, &t.player2, &5, &5);
+
+    t.client.respond(&14, &t.player1, &false, &dummy_commitment(&t.env, 10), &proof, &pubs, &proof, &pubs);
+    let result = t.client.try_respond(&14, &t.player1, &false, &dummy_commitment(&t.env, 11), &proof, &pubs, &proof, &pubs);
+    assert_error(&result, Error::AlreadyResponded);
+}
+
+#[test]
+fn test_cannot_respond_in_firing_phase() {
+    let t = setup_test();
+    setup_firing_phase(&t, 15);
+
+    let proof = dummy_proof(&t.env);
+    let pubs = dummy_proof(&t.env);
+
+    let result = t.client.try_respond(&15, &t.player1, &false, &dummy_commitment(&t.env, 10), &proof, &pubs, &proof, &pubs);
+    assert_error(&result, Error::InvalidPhase);
 }
 
 // ============================================================================
@@ -352,83 +438,166 @@ fn test_equalizer_miss_p1_wins() {
 // ============================================================================
 
 #[test]
-fn test_full_game_multiple_rounds() {
-    let (env, client, player1, player2) = setup_test();
-    let session_id = 20u32;
-    client.create_game(&session_id, &player1, &player2, &500_0000000, &500_0000000);
+fn test_full_simultaneous_game_p1_wins() {
+    let t = setup_test();
+    setup_firing_phase(&t, 20);
 
-    let proof = dummy_proof(&env);
-    let pubs = dummy_proof(&env);
-    client.commit_position(&session_id, &player1, &dummy_commitment(&env, 1), &proof, &pubs);
-    client.commit_position(&session_id, &player2, &dummy_commitment(&env, 2), &proof, &pubs);
+    let proof = dummy_proof(&t.env);
+    let pubs = dummy_proof(&t.env);
 
-    // Round 1: P1 fires, P2 misses
-    client.fire(&session_id, &player1, &0, &0);
-    client.respond(&session_id, &player2, &false, &dummy_commitment(&env, 3), &proof, &pubs, &proof, &pubs);
+    // Round 0: both miss
+    t.client.fire(&20, &t.player1, &0, &0);
+    t.client.fire(&20, &t.player2, &5, &5);
+    t.client.respond(&20, &t.player1, &false, &dummy_commitment(&t.env, 10), &proof, &pubs, &proof, &pubs);
+    t.client.respond(&20, &t.player2, &false, &dummy_commitment(&t.env, 11), &proof, &pubs, &proof, &pubs);
 
-    // Round 1: P2 fires, P1 misses
-    client.fire(&session_id, &player2, &5, &5);
-    client.respond(&session_id, &player1, &false, &dummy_commitment(&env, 4), &proof, &pubs, &proof, &pubs);
+    let game = t.client.get_game(&20);
+    assert_eq!(game.round_number, 1);
+    assert_eq!(game.phase, GamePhase::Firing);
 
-    // Round 2: P1 fires, P2 misses
-    client.fire(&session_id, &player1, &1, &1);
-    client.respond(&session_id, &player2, &false, &dummy_commitment(&env, 5), &proof, &pubs, &proof, &pubs);
+    // Round 1: P1 hits P2, P2 misses P1
+    t.client.fire(&20, &t.player1, &1, &1);
+    t.client.fire(&20, &t.player2, &4, &4);
+    t.client.respond(&20, &t.player1, &false, &dummy_commitment(&t.env, 12), &proof, &pubs, &proof, &pubs);
+    t.client.respond(&20, &t.player2, &true, &dummy_commitment(&t.env, 13), &proof, &pubs, &proof, &pubs);
 
-    // Round 2: P2 fires and hits P1!
-    client.fire(&session_id, &player2, &2, &2);
-    client.respond(&session_id, &player1, &true, &dummy_commitment(&env, 6), &proof, &pubs, &proof, &pubs);
-
-    // P1 gets equalizer, fires and misses
-    client.fire(&session_id, &player1, &4, &4);
-    client.respond(&session_id, &player2, &false, &dummy_commitment(&env, 7), &proof, &pubs, &proof, &pubs);
-
-    let game = client.get_game(&session_id);
+    let game = t.client.get_game(&20);
     assert_eq!(game.phase, GamePhase::Finished);
-    assert_eq!(game.winner, Some(player2));
-    assert_eq!(game.blocked_x.len(), 5);
+    assert_eq!(game.winner, Some(t.player1.clone()));
+
+    // Verify payouts
+    let total_pot = STAKE * 2;
+    let fee = total_pot / 10;
+    let prize = total_pot - fee;
+    assert_eq!(token_balance(&t.env, &t.token_addr, &t.player1), INITIAL_BALANCE - STAKE + prize);
+    assert_eq!(contract_balance(&t), 0);
+}
+
+#[test]
+fn test_full_simultaneous_game_draw() {
+    let t = setup_test();
+    setup_firing_phase(&t, 21);
+
+    let proof = dummy_proof(&t.env);
+    let pubs = dummy_proof(&t.env);
+
+    // Round 0: both hit each other
+    t.client.fire(&21, &t.player1, &3, &3);
+    t.client.fire(&21, &t.player2, &2, &2);
+    t.client.respond(&21, &t.player1, &true, &dummy_commitment(&t.env, 10), &proof, &pubs, &proof, &pubs);
+    t.client.respond(&21, &t.player2, &true, &dummy_commitment(&t.env, 11), &proof, &pubs, &proof, &pubs);
+
+    let game = t.client.get_game(&21);
+    assert_eq!(game.phase, GamePhase::Finished);
+    assert!(game.winner.is_none());
+    assert!(game.is_draw);
+
+    // Both refunded
+    assert_eq!(token_balance(&t.env, &t.token_addr, &t.player1), INITIAL_BALANCE);
+    assert_eq!(token_balance(&t.env, &t.token_addr, &t.player2), INITIAL_BALANCE);
 }
 
 // ============================================================================
-// Timeout Tests
+// Timeout Tests (Phase-Aware)
 // ============================================================================
 
 #[test]
-fn test_claim_timeout() {
-    let (env, client, player1, player2) = setup_test();
-    let session_id = 30u32;
-    client.create_game(&session_id, &player1, &player2, &100, &100);
+fn test_timeout_setup_cancels_game() {
+    let t = setup_test();
+    t.client.create_game(&30, &t.player1, &t.player2, &STAKE, &STAKE);
 
-    let proof = dummy_proof(&env);
-    let pubs = dummy_proof(&env);
-    client.commit_position(&session_id, &player1, &dummy_commitment(&env, 1), &proof, &pubs);
-    client.commit_position(&session_id, &player2, &dummy_commitment(&env, 2), &proof, &pubs);
+    // Only P1 commits
+    let proof = dummy_proof(&t.env);
+    let pubs = dummy_proof(&t.env);
+    t.client.commit_position(&30, &t.player1, &dummy_commitment(&t.env, 1), &proof, &pubs);
 
-    env.ledger().set(soroban_sdk::testutils::LedgerInfo {
-        timestamp: 1441065600 + 125,
-        protocol_version: 25,
-        sequence_number: 125,
-        network_id: Default::default(),
-        base_reserve: 10,
-        min_temp_entry_ttl: u32::MAX / 2,
-        min_persistent_entry_ttl: u32::MAX / 2,
-        max_entry_ttl: u32::MAX / 2,
-    });
+    // Advance past setup timeout (36 ledgers)
+    set_ledger(&t.env, 140);
 
-    let winner = client.claim_timeout(&session_id, &player2);
-    assert_eq!(winner, player2);
+    let result = t.client.claim_timeout(&30, &t.player1);
+    assert_eq!(result, t.player1);
 
-    let game = client.get_game(&session_id);
+    let game = t.client.get_game(&30);
     assert_eq!(game.phase, GamePhase::Finished);
-    assert_eq!(game.winner, Some(player2));
+    assert!(game.is_draw);
+
+    // Both refunded
+    assert_eq!(token_balance(&t.env, &t.token_addr, &t.player1), INITIAL_BALANCE);
+    assert_eq!(token_balance(&t.env, &t.token_addr, &t.player2), INITIAL_BALANCE);
+    assert_eq!(contract_balance(&t), 0);
+}
+
+#[test]
+fn test_timeout_firing_winner_is_who_fired() {
+    let t = setup_test();
+    setup_firing_phase(&t, 31);
+
+    // P1 fires, P2 doesn't
+    t.client.fire(&31, &t.player1, &0, &0);
+
+    // Advance past action timeout
+    set_ledger(&t.env, 140);
+
+    let winner = t.client.claim_timeout(&31, &t.player1);
+    assert_eq!(winner, t.player1);
+
+    let game = t.client.get_game(&31);
+    assert_eq!(game.phase, GamePhase::Finished);
+    assert_eq!(game.winner, Some(t.player1.clone()));
+
+    // P1 gets 90% of pot
+    let total_pot = STAKE * 2;
+    let fee = total_pot / 10;
+    let prize = total_pot - fee;
+    assert_eq!(token_balance(&t.env, &t.token_addr, &t.player1), INITIAL_BALANCE - STAKE + prize);
+    assert_eq!(contract_balance(&t), 0);
+}
+
+#[test]
+fn test_timeout_responding_winner_is_who_responded() {
+    let t = setup_test();
+    setup_firing_phase(&t, 32);
+
+    let proof = dummy_proof(&t.env);
+    let pubs = dummy_proof(&t.env);
+
+    // Both fire
+    t.client.fire(&32, &t.player1, &0, &0);
+    t.client.fire(&32, &t.player2, &5, &5);
+
+    // P1 responds, P2 doesn't
+    t.client.respond(&32, &t.player1, &false, &dummy_commitment(&t.env, 10), &proof, &pubs, &proof, &pubs);
+
+    // Advance past action timeout
+    set_ledger(&t.env, 140);
+
+    let winner = t.client.claim_timeout(&32, &t.player1);
+    assert_eq!(winner, t.player1);
+
+    let game = t.client.get_game(&32);
+    assert_eq!(game.phase, GamePhase::Finished);
+    assert_eq!(game.winner, Some(t.player1.clone()));
+    assert_eq!(contract_balance(&t), 0);
+}
+
+#[test]
+fn test_cannot_claim_timeout_if_not_fired() {
+    let t = setup_test();
+    setup_firing_phase(&t, 33);
+
+    // Neither fires, advance past timeout
+    set_ledger(&t.env, 140);
+
+    let result = t.client.try_claim_timeout(&33, &t.player1);
+    assert_error(&result, Error::InvalidPhase);
 }
 
 #[test]
 fn test_cannot_claim_timeout_early() {
-    let (_env, client, player1, player2) = setup_test();
-    let session_id = 31u32;
-    client.create_game(&session_id, &player1, &player2, &100, &100);
+    let t = setup_test();
+    t.client.create_game(&34, &t.player1, &t.player2, &STAKE, &STAKE);
 
-    let result = client.try_claim_timeout(&session_id, &player2);
+    let result = t.client.try_claim_timeout(&34, &t.player1);
     assert_error(&result, Error::TimedOut);
 }
 
@@ -438,38 +607,35 @@ fn test_cannot_claim_timeout_early() {
 
 #[test]
 fn test_game_not_found() {
-    let (_env, client, _p1, _p2) = setup_test();
-    let result = client.try_get_game(&999);
+    let t = setup_test();
+    let result = t.client.try_get_game(&999);
     assert_error(&result, Error::GameNotFound);
 }
 
 #[test]
 fn test_cannot_fire_before_commit() {
-    let (_env, client, player1, player2) = setup_test();
-    let session_id = 40u32;
-    client.create_game(&session_id, &player1, &player2, &100, &100);
+    let t = setup_test();
+    t.client.create_game(&40, &t.player1, &t.player2, &STAKE, &STAKE);
 
-    let result = client.try_fire(&session_id, &player1, &0, &0);
+    let result = t.client.try_fire(&40, &t.player1, &0, &0);
     assert_error(&result, Error::InvalidPhase);
 }
 
 #[test]
 fn test_cannot_fire_after_game_ended() {
-    let (env, client, player1, player2) = setup_test();
-    let session_id = 41u32;
-    client.create_game(&session_id, &player1, &player2, &100, &100);
+    let t = setup_test();
+    setup_firing_phase(&t, 41);
 
-    let proof = dummy_proof(&env);
-    let pubs = dummy_proof(&env);
-    client.commit_position(&session_id, &player1, &dummy_commitment(&env, 1), &proof, &pubs);
-    client.commit_position(&session_id, &player2, &dummy_commitment(&env, 2), &proof, &pubs);
+    let proof = dummy_proof(&t.env);
+    let pubs = dummy_proof(&t.env);
 
-    client.fire(&session_id, &player1, &0, &0);
-    client.respond(&session_id, &player2, &true, &dummy_commitment(&env, 10), &proof, &pubs, &proof, &pubs);
-    client.fire(&session_id, &player2, &5, &5);
-    client.respond(&session_id, &player1, &false, &dummy_commitment(&env, 20), &proof, &pubs, &proof, &pubs);
+    // Quick game: both fire, P2 hit
+    t.client.fire(&41, &t.player1, &3, &3);
+    t.client.fire(&41, &t.player2, &0, &0);
+    t.client.respond(&41, &t.player1, &false, &dummy_commitment(&t.env, 10), &proof, &pubs, &proof, &pubs);
+    t.client.respond(&41, &t.player2, &true, &dummy_commitment(&t.env, 11), &proof, &pubs, &proof, &pubs);
 
-    let result = client.try_fire(&session_id, &player1, &1, &1);
+    let result = t.client.try_fire(&41, &t.player1, &1, &1);
     assert_error(&result, Error::InvalidPhase);
 }
 
@@ -479,199 +645,353 @@ fn test_cannot_fire_after_game_ended() {
 
 #[test]
 fn test_create_public_room() {
-    let (env, client, player1, _player2) = setup_test();
-    let session_id = 100u32;
-    let stake = 500_0000000i128;
+    let t = setup_test();
+    t.client.create_room(&100, &t.player1, &STAKE, &true, &zero_hash(&t.env));
 
-    client.create_room(&session_id, &player1, &stake, &true, &zero_hash(&env));
-
-    let room = client.get_room(&session_id);
-    assert_eq!(room.creator, player1);
-    assert_eq!(room.stake, stake);
+    let room = t.client.get_room(&100);
+    assert_eq!(room.creator, t.player1);
     assert!(room.is_public);
 
-    let public_rooms = client.list_public_rooms();
+    let public_rooms = t.client.list_public_rooms();
     assert_eq!(public_rooms.len(), 1);
-    assert_eq!(public_rooms.get(0).unwrap(), session_id);
+
+    // Creator's stake is in escrow
+    assert_eq!(token_balance(&t.env, &t.token_addr, &t.player1), INITIAL_BALANCE - STAKE);
+    assert_eq!(contract_balance(&t), STAKE);
 }
 
 #[test]
 fn test_create_private_room() {
-    let (env, client, player1, _player2) = setup_test();
-    let session_id = 101u32;
+    let t = setup_test();
+    let password_bytes = Bytes::from_slice(&t.env, &[42u8; 32]);
+    let password_hash = BytesN::from_array(&t.env, &t.env.crypto().keccak256(&password_bytes).to_array());
 
-    // Hash a password
-    let password_bytes = Bytes::from_slice(&env, &[42u8; 32]);
-    let password_hash_raw = env.crypto().keccak256(&password_bytes);
-    let password_hash = BytesN::from_array(&env, &password_hash_raw.to_array());
+    t.client.create_room(&101, &t.player1, &STAKE, &false, &password_hash);
 
-    client.create_room(&session_id, &player1, &100, &false, &password_hash);
-
-    let room = client.get_room(&session_id);
+    let room = t.client.get_room(&101);
     assert!(!room.is_public);
-    assert_eq!(room.password_hash, password_hash);
 
-    // Should NOT appear in public room list
-    let public_rooms = client.list_public_rooms();
+    let public_rooms = t.client.list_public_rooms();
     assert_eq!(public_rooms.len(), 0);
+
+    // Stake in escrow
+    assert_eq!(token_balance(&t.env, &t.token_addr, &t.player1), INITIAL_BALANCE - STAKE);
 }
 
 #[test]
 fn test_join_public_room() {
-    let (env, client, player1, player2) = setup_test();
-    let session_id = 102u32;
+    let t = setup_test();
+    t.client.create_room(&102, &t.player1, &STAKE, &true, &zero_hash(&t.env));
+    t.client.join_room(&102, &t.player2, &zero_hash(&t.env));
 
-    client.create_room(&session_id, &player1, &100, &true, &zero_hash(&env));
-
-    // Player2 joins
-    client.join_room(&session_id, &player2, &zero_hash(&env));
-
-    // Room should be gone
-    let result = client.try_get_room(&session_id);
+    let result = t.client.try_get_room(&102);
     assert_error(&result, Error::RoomNotFound);
 
-    // Game should exist
-    let game = client.get_game(&session_id);
-    assert_eq!(game.player1, player1);
-    assert_eq!(game.player2, player2);
+    let game = t.client.get_game(&102);
+    assert_eq!(game.player1, t.player1);
+    assert_eq!(game.player2, t.player2);
     assert_eq!(game.phase, GamePhase::Setup);
 
-    // Public list should be empty
-    let public_rooms = client.list_public_rooms();
-    assert_eq!(public_rooms.len(), 0);
+    // Both stakes in escrow
+    assert_eq!(token_balance(&t.env, &t.token_addr, &t.player1), INITIAL_BALANCE - STAKE);
+    assert_eq!(token_balance(&t.env, &t.token_addr, &t.player2), INITIAL_BALANCE - STAKE);
+    assert_eq!(contract_balance(&t), STAKE * 2);
 }
 
 #[test]
 fn test_join_private_room_correct_password() {
-    let (env, client, player1, player2) = setup_test();
-    let session_id = 103u32;
+    let t = setup_test();
+    let password = BytesN::from_array(&t.env, &[42u8; 32]);
+    let password_bytes = Bytes::from_slice(&t.env, &[42u8; 32]);
+    let password_hash = BytesN::from_array(&t.env, &t.env.crypto().keccak256(&password_bytes).to_array());
 
-    let password = BytesN::from_array(&env, &[42u8; 32]);
-    let password_bytes = Bytes::from_slice(&env, &[42u8; 32]);
-    let password_hash_raw = env.crypto().keccak256(&password_bytes);
-    let password_hash = BytesN::from_array(&env, &password_hash_raw.to_array());
+    t.client.create_room(&103, &t.player1, &STAKE, &false, &password_hash);
+    t.client.join_room(&103, &t.player2, &password);
 
-    client.create_room(&session_id, &player1, &100, &false, &password_hash);
-
-    // Join with correct password
-    client.join_room(&session_id, &player2, &password);
-
-    let game = client.get_game(&session_id);
-    assert_eq!(game.player1, player1);
-    assert_eq!(game.player2, player2);
+    let game = t.client.get_game(&103);
+    assert_eq!(game.player1, t.player1);
+    assert_eq!(game.player2, t.player2);
 }
 
 #[test]
 fn test_join_private_room_wrong_password() {
-    let (env, client, player1, player2) = setup_test();
-    let session_id = 104u32;
+    let t = setup_test();
+    let password_bytes = Bytes::from_slice(&t.env, &[42u8; 32]);
+    let password_hash = BytesN::from_array(&t.env, &t.env.crypto().keccak256(&password_bytes).to_array());
 
-    let password_bytes = Bytes::from_slice(&env, &[42u8; 32]);
-    let password_hash_raw = env.crypto().keccak256(&password_bytes);
-    let password_hash = BytesN::from_array(&env, &password_hash_raw.to_array());
+    t.client.create_room(&104, &t.player1, &STAKE, &false, &password_hash);
 
-    client.create_room(&session_id, &player1, &100, &false, &password_hash);
-
-    // Try with wrong password
-    let wrong_password = BytesN::from_array(&env, &[99u8; 32]);
-    let result = client.try_join_room(&session_id, &player2, &wrong_password);
+    let wrong_password = BytesN::from_array(&t.env, &[99u8; 32]);
+    let result = t.client.try_join_room(&104, &t.player2, &wrong_password);
     assert_error(&result, Error::WrongPassword);
 }
 
 #[test]
 fn test_self_join_rejected() {
-    let (env, client, player1, _player2) = setup_test();
-    let session_id = 105u32;
+    let t = setup_test();
+    t.client.create_room(&105, &t.player1, &STAKE, &true, &zero_hash(&t.env));
 
-    client.create_room(&session_id, &player1, &100, &true, &zero_hash(&env));
-
-    let result = client.try_join_room(&session_id, &player1, &zero_hash(&env));
-    assert_error(&result, Error::SelfPlay);
+    // Creator tries to join own room → AlreadyInGame (checked before SelfPlay)
+    let result = t.client.try_join_room(&105, &t.player1, &zero_hash(&t.env));
+    assert_error(&result, Error::AlreadyInGame);
 }
 
 #[test]
 fn test_cancel_room() {
-    let (env, client, player1, _player2) = setup_test();
-    let session_id = 106u32;
+    let t = setup_test();
+    t.client.create_room(&106, &t.player1, &STAKE, &true, &zero_hash(&t.env));
 
-    client.create_room(&session_id, &player1, &100, &true, &zero_hash(&env));
+    assert_eq!(t.client.list_public_rooms().len(), 1);
+    assert_eq!(token_balance(&t.env, &t.token_addr, &t.player1), INITIAL_BALANCE - STAKE);
 
-    // Verify it exists
-    let public_rooms = client.list_public_rooms();
-    assert_eq!(public_rooms.len(), 1);
+    t.client.cancel_room(&106, &t.player1);
 
-    // Cancel
-    client.cancel_room(&session_id, &player1);
-
-    // Should be gone
-    let result = client.try_get_room(&session_id);
+    let result = t.client.try_get_room(&106);
     assert_error(&result, Error::RoomNotFound);
+    assert_eq!(t.client.list_public_rooms().len(), 0);
 
-    let public_rooms = client.list_public_rooms();
-    assert_eq!(public_rooms.len(), 0);
+    // Stake refunded
+    assert_eq!(token_balance(&t.env, &t.token_addr, &t.player1), INITIAL_BALANCE);
+    assert_eq!(contract_balance(&t), 0);
 }
 
 #[test]
 fn test_cancel_room_not_creator() {
-    let (env, client, player1, player2) = setup_test();
-    let session_id = 107u32;
+    let t = setup_test();
+    t.client.create_room(&107, &t.player1, &STAKE, &true, &zero_hash(&t.env));
 
-    client.create_room(&session_id, &player1, &100, &true, &zero_hash(&env));
-
-    // Player2 tries to cancel
-    let result = client.try_cancel_room(&session_id, &player2);
+    let result = t.client.try_cancel_room(&107, &t.player2);
     assert_error(&result, Error::NotCreator);
 }
 
 #[test]
 fn test_list_public_rooms_multiple() {
-    let (env, client, player1, _player2) = setup_test();
+    let t = setup_test();
+    let player3 = Address::generate(&t.env);
+    let sac = token::StellarAssetClient::new(&t.env, &t.token_addr);
+    sac.mint(&player3, &INITIAL_BALANCE);
 
-    client.create_room(&200, &player1, &100, &true, &zero_hash(&env));
-    client.create_room(&201, &player1, &200, &true, &zero_hash(&env));
-    client.create_room(&202, &player1, &50, &false, &zero_hash(&env)); // private
+    // Each room needs a different creator (AlreadyInGame guard)
+    t.client.create_room(&200, &t.player1, &STAKE, &true, &zero_hash(&t.env));
+    t.client.create_room(&201, &t.player2, &STAKE, &true, &zero_hash(&t.env));
+    t.client.create_room(&202, &player3, &STAKE, &false, &zero_hash(&t.env));
 
-    let public_rooms = client.list_public_rooms();
+    let public_rooms = t.client.list_public_rooms();
     assert_eq!(public_rooms.len(), 2);
-    assert_eq!(public_rooms.get(0).unwrap(), 200);
-    assert_eq!(public_rooms.get(1).unwrap(), 201);
 }
 
 #[test]
 fn test_room_already_exists() {
-    let (env, client, player1, _player2) = setup_test();
-    let session_id = 108u32;
+    let t = setup_test();
+    t.client.create_room(&108, &t.player1, &STAKE, &true, &zero_hash(&t.env));
 
-    client.create_room(&session_id, &player1, &100, &true, &zero_hash(&env));
-
-    let result = client.try_create_room(&session_id, &player1, &100, &true, &zero_hash(&env));
+    // Different player tries same session_id → RoomAlreadyExists
+    let result = t.client.try_create_room(&108, &t.player2, &STAKE, &true, &zero_hash(&t.env));
     assert_error(&result, Error::RoomAlreadyExists);
 }
 
+// ============================================================================
+// Room Expiry Tests
+// ============================================================================
+
+#[test]
+fn test_join_expired_room() {
+    let t = setup_test();
+    t.client.create_room(&110, &t.player1, &STAKE, &true, &zero_hash(&t.env));
+
+    // Advance past room timeout (120 ledgers)
+    set_ledger(&t.env, 225);
+
+    let result = t.client.try_join_room(&110, &t.player2, &zero_hash(&t.env));
+    assert_error(&result, Error::RoomNotFound);
+
+    // Stake is still escrowed until creator cancels or list_public_rooms prunes
+    assert_eq!(token_balance(&t.env, &t.token_addr, &t.player1), INITIAL_BALANCE - STAKE);
+
+    // Creator cancels to get refund (works even after expiry)
+    t.client.cancel_room(&110, &t.player1);
+    assert_eq!(token_balance(&t.env, &t.token_addr, &t.player1), INITIAL_BALANCE);
+}
+
+#[test]
+fn test_list_public_rooms_prunes_expired() {
+    let t = setup_test();
+    // Each room needs a different creator (AlreadyInGame guard)
+    t.client.create_room(&111, &t.player1, &STAKE, &true, &zero_hash(&t.env));
+    t.client.create_room(&112, &t.player2, &STAKE, &true, &zero_hash(&t.env));
+
+    // Advance past room timeout
+    set_ledger(&t.env, 225);
+
+    let public_rooms = t.client.list_public_rooms();
+    assert_eq!(public_rooms.len(), 0);
+
+    // Both creators refunded
+    assert_eq!(token_balance(&t.env, &t.token_addr, &t.player1), INITIAL_BALANCE);
+    assert_eq!(token_balance(&t.env, &t.token_addr, &t.player2), INITIAL_BALANCE);
+}
+
+// ============================================================================
+// Full Room-to-Game Flow
+// ============================================================================
+
 #[test]
 fn test_full_room_to_game_flow() {
-    let (env, client, player1, player2) = setup_test();
-    let session_id = 109u32;
+    let t = setup_test();
+    t.client.create_room(&109, &t.player1, &STAKE, &true, &zero_hash(&t.env));
+    t.client.join_room(&109, &t.player2, &zero_hash(&t.env));
 
-    // P1 creates room
-    client.create_room(&session_id, &player1, &500_0000000, &true, &zero_hash(&env));
+    let proof = dummy_proof(&t.env);
+    let pubs = dummy_proof(&t.env);
+    t.client.commit_position(&109, &t.player1, &dummy_commitment(&t.env, 1), &proof, &pubs);
+    t.client.commit_position(&109, &t.player2, &dummy_commitment(&t.env, 2), &proof, &pubs);
 
-    // P2 joins room → creates game
-    client.join_room(&session_id, &player2, &zero_hash(&env));
+    // Both fire, P2 gets hit
+    t.client.fire(&109, &t.player1, &3, &3);
+    t.client.fire(&109, &t.player2, &5, &5);
+    t.client.respond(&109, &t.player1, &false, &dummy_commitment(&t.env, 10), &proof, &pubs, &proof, &pubs);
+    t.client.respond(&109, &t.player2, &true, &dummy_commitment(&t.env, 11), &proof, &pubs, &proof, &pubs);
 
-    // Both commit positions
-    let proof = dummy_proof(&env);
-    let pubs = dummy_proof(&env);
-    client.commit_position(&session_id, &player1, &dummy_commitment(&env, 1), &proof, &pubs);
-    client.commit_position(&session_id, &player2, &dummy_commitment(&env, 2), &proof, &pubs);
-
-    // P1 fires, P2 responds hit → equalizer → P2 misses → P1 wins
-    client.fire(&session_id, &player1, &3, &3);
-    client.respond(&session_id, &player2, &true, &dummy_commitment(&env, 10), &proof, &pubs, &proof, &pubs);
-    client.fire(&session_id, &player2, &5, &5);
-    client.respond(&session_id, &player1, &false, &dummy_commitment(&env, 20), &proof, &pubs, &proof, &pubs);
-
-    let game = client.get_game(&session_id);
+    let game = t.client.get_game(&109);
     assert_eq!(game.phase, GamePhase::Finished);
-    assert_eq!(game.winner, Some(player1));
+    assert_eq!(game.winner, Some(t.player1.clone()));
+
+    // Verify payouts: P1 wins 90% of 100 XLM pot
+    let total_pot = STAKE * 2;
+    let prize = total_pot - total_pot / 10;
+    assert_eq!(token_balance(&t.env, &t.token_addr, &t.player1), INITIAL_BALANCE - STAKE + prize);
+    assert_eq!(contract_balance(&t), 0);
+}
+
+// ============================================================================
+// Active Game Tracking Tests
+// ============================================================================
+
+#[test]
+fn test_already_in_game_room() {
+    let t = setup_test();
+    t.client.create_room(&300, &t.player1, &STAKE, &true, &zero_hash(&t.env));
+
+    // Player1 tries to create another room → AlreadyInGame
+    let result = t.client.try_create_room(&301, &t.player1, &STAKE, &true, &zero_hash(&t.env));
+    assert_error(&result, Error::AlreadyInGame);
+}
+
+#[test]
+fn test_already_in_game_join() {
+    let t = setup_test();
+    let player3 = Address::generate(&t.env);
+    let sac = token::StellarAssetClient::new(&t.env, &t.token_addr);
+    sac.mint(&player3, &INITIAL_BALANCE);
+
+    // Player2 creates a room, player3 creates another
+    t.client.create_room(&302, &t.player2, &STAKE, &true, &zero_hash(&t.env));
+    t.client.create_room(&303, &player3, &STAKE, &true, &zero_hash(&t.env));
+
+    // Player1 joins player2's room
+    t.client.join_room(&302, &t.player1, &zero_hash(&t.env));
+
+    // Player1 tries to join player3's room → AlreadyInGame
+    let result = t.client.try_join_room(&303, &t.player1, &zero_hash(&t.env));
+    assert_error(&result, Error::AlreadyInGame);
+}
+
+#[test]
+fn test_active_game_cleared_on_finish() {
+    let t = setup_test();
+    t.client.create_room(&304, &t.player1, &STAKE, &true, &zero_hash(&t.env));
+    t.client.join_room(&304, &t.player2, &zero_hash(&t.env));
+
+    // Verify active game is set
+    assert_eq!(t.client.get_active_game(&t.player1), Some(304));
+    assert_eq!(t.client.get_active_game(&t.player2), Some(304));
+
+    let proof = dummy_proof(&t.env);
+    let pubs = dummy_proof(&t.env);
+    t.client.commit_position(&304, &t.player1, &dummy_commitment(&t.env, 1), &proof, &pubs);
+    t.client.commit_position(&304, &t.player2, &dummy_commitment(&t.env, 2), &proof, &pubs);
+
+    // Quick game: both fire, P2 hit
+    t.client.fire(&304, &t.player1, &3, &3);
+    t.client.fire(&304, &t.player2, &0, &0);
+    t.client.respond(&304, &t.player1, &false, &dummy_commitment(&t.env, 10), &proof, &pubs, &proof, &pubs);
+    t.client.respond(&304, &t.player2, &true, &dummy_commitment(&t.env, 11), &proof, &pubs, &proof, &pubs);
+
+    // Active game cleared → both can create new rooms
+    assert_eq!(t.client.get_active_game(&t.player1), None);
+    assert_eq!(t.client.get_active_game(&t.player2), None);
+    t.client.create_room(&305, &t.player1, &STAKE, &true, &zero_hash(&t.env));
+    t.client.create_room(&306, &t.player2, &STAKE, &true, &zero_hash(&t.env));
+}
+
+#[test]
+fn test_active_game_cleared_on_cancel() {
+    let t = setup_test();
+    t.client.create_room(&307, &t.player1, &STAKE, &true, &zero_hash(&t.env));
+
+    assert_eq!(t.client.get_active_game(&t.player1), Some(307));
+
+    t.client.cancel_room(&307, &t.player1);
+
+    // Active game cleared → can create a new room
+    assert_eq!(t.client.get_active_game(&t.player1), None);
+    t.client.create_room(&308, &t.player1, &STAKE, &true, &zero_hash(&t.env));
+}
+
+#[test]
+fn test_active_game_cleared_on_timeout() {
+    let t = setup_test();
+    setup_firing_phase(&t, 309);
+
+    // P1 fires, P2 doesn't
+    t.client.fire(&309, &t.player1, &0, &0);
+    set_ledger(&t.env, 140);
+
+    t.client.claim_timeout(&309, &t.player1);
+
+    // Both can now create rooms
+    assert_eq!(t.client.get_active_game(&t.player1), None);
+    assert_eq!(t.client.get_active_game(&t.player2), None);
+    t.client.create_room(&310, &t.player1, &STAKE, &true, &zero_hash(&t.env));
+    t.client.create_room(&311, &t.player2, &STAKE, &true, &zero_hash(&t.env));
+}
+
+// ============================================================================
+// Max Rounds Draw Test
+// ============================================================================
+
+#[test]
+fn test_max_rounds_draw() {
+    let t = setup_test();
+    setup_firing_phase(&t, 400);
+
+    let proof = dummy_proof(&t.env);
+    let pubs = dummy_proof(&t.env);
+
+    // Play 36 rounds of both missing
+    for round in 0u32..36 {
+        let x1 = round % 6;
+        let y1 = round / 6;
+        let x2 = 5 - (round % 6);
+        let y2 = 5 - (round / 6);
+
+        t.client.fire(&400, &t.player1, &x1, &y1);
+        t.client.fire(&400, &t.player2, &x2, &y2);
+
+        let seed1 = (round * 2 + 10) as u8;
+        let seed2 = (round * 2 + 11) as u8;
+        t.client.respond(&400, &t.player1, &false, &dummy_commitment(&t.env, seed1), &proof, &pubs, &proof, &pubs);
+        t.client.respond(&400, &t.player2, &false, &dummy_commitment(&t.env, seed2), &proof, &pubs, &proof, &pubs);
+    }
+
+    let game = t.client.get_game(&400);
+    assert_eq!(game.phase, GamePhase::Finished);
+    assert!(game.winner.is_none());
+    assert!(game.is_draw);
+    assert_eq!(game.round_number, 36);
+
+    // Both refunded on max rounds draw
+    assert_eq!(token_balance(&t.env, &t.token_addr, &t.player1), INITIAL_BALANCE);
+    assert_eq!(token_balance(&t.env, &t.token_addr, &t.player2), INITIAL_BALANCE);
+    assert_eq!(contract_balance(&t), 0);
 }

@@ -1,94 +1,107 @@
-import { useState, useEffect } from 'react';
+import { useEffect } from 'react';
+import { BrowserRouter, Routes, Route, Navigate, Link } from 'react-router-dom';
+import { Toaster } from 'sonner';
+import { initWalletKit } from './lib/walletKit';
 import { useWallet } from './hooks/useWallet';
-import type { AppScreen } from './games/zero-trace/types';
 import { BottomNav } from './components/BottomNav';
-import { BalanceBadge } from './components/BalanceBadge';
+import { WalletButton } from './components/WalletButton';
+import { ActiveGameGuard } from './components/ActiveGameGuard';
 import { HomeScreen } from './screens/HomeScreen';
-import { PlayScreen } from './screens/PlayScreen';
-import { ProfileScreen } from './screens/ProfileScreen';
+import { HowItWorksScreen } from './screens/HowItWorksScreen';
+import { PlayMenu } from './screens/play/PlayMenu';
+import { CreateRoomForm } from './screens/play/CreateRoomForm';
+import { RoomList } from './screens/play/RoomList';
+import { GameRoom } from './screens/GameRoom';
+import { AccountScreen } from './screens/AccountScreen';
+import { TutorialScreen } from './screens/TutorialScreen';
+
+/** Fixed layout heights — used by GameRoom via CSS var */
+const HEADER_H = 48;
+const NAV_H = 56;
+
+function ConnectGuard({ children }: { children: React.ReactNode }) {
+  const { isConnected, connect } = useWallet();
+  if (!isConnected) {
+    return (
+      <div className="mt-8 p-5 rounded-2xl bg-slate-900/50 border border-slate-800 text-center space-y-3">
+        <p className="text-sm text-slate-400">Connect your wallet to continue</p>
+        <button
+          onClick={connect}
+          className="px-4 py-2 rounded-lg bg-primary text-primary-foreground text-sm font-medium hover:opacity-90 transition-opacity"
+        >
+          Connect Wallet
+        </button>
+      </div>
+    );
+  }
+  return <>{children}</>;
+}
 
 export default function App() {
-  const { publicKey, isConnected, balance, error, initAccount, refreshBalance, fundAccount, resetAccount } = useWallet();
-  const [screen, setScreen] = useState<AppScreen>('home');
-  const [playAction, setPlayAction] = useState<string | null>(null);
-  const [funding, setFunding] = useState(false);
+  useEffect(() => { initWalletKit(); }, []);
 
-  // Auto-init on mount
   useEffect(() => {
-    initAccount();
+    const root = document.documentElement;
+    root.style.setProperty('--header-h', `${HEADER_H}px`);
+    root.style.setProperty('--nav-h', `${NAV_H}px`);
   }, []);
 
-  // Refresh balance on connect
-  useEffect(() => {
-    if (isConnected) refreshBalance();
-  }, [isConnected]);
-
-  const handleNavigate = (s: AppScreen, action?: string) => {
-    setScreen(s);
-    if (action) setPlayAction(action);
-    else setPlayAction(null);
-  };
-
-  const handleFund = async () => {
-    setFunding(true);
-    try {
-      await fundAccount();
-    } finally {
-      setFunding(false);
-    }
-  };
-
   return (
-    <div className="min-h-dvh w-full flex flex-col items-center bg-slate-950">
-      <div className="w-full max-w-[400px] min-h-dvh flex flex-col pb-20">
-        {/* Header */}
-        <header className="flex items-center justify-between px-4 pt-5 pb-2">
-          <h1
-            className="text-xl font-black tracking-tighter text-white cursor-pointer"
-            onClick={() => handleNavigate('home')}
+    <BrowserRouter>
+      <div className="min-h-dvh w-full flex flex-col items-center bg-slate-950">
+        {/* App shell — side borders visible on tablet/desktop */}
+        <div className="w-full max-w-[400px] min-h-dvh flex flex-col border-x border-border/20 shadow-[inset_1px_0_0_oklch(1_0_0/0.03),-1px_0_0_oklch(1_0_0/0.03)]">
+          {/* Header */}
+          <header
+            className="shrink-0 flex items-center justify-between px-4 border-b border-border/30 shadow-[0_1px_8px_oklch(0_0_0/0.4)] z-40 bg-slate-950"
+            style={{ height: HEADER_H }}
           >
-            ZERO<span className="text-cyan-500">TRACE</span>
-          </h1>
-          {isConnected && (
-            <BalanceBadge balance={balance} onFund={handleFund} loading={funding} />
-          )}
-        </header>
+            <Link to="/" className="text-xl font-black tracking-tighter text-white">
+              ZERO<span className="text-cyan-500">TRACE</span>
+            </Link>
+            <WalletButton />
+          </header>
 
-        {/* Testnet Badge */}
-        <div className="px-4 pb-2">
-          <div className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-emerald-500/10 border border-emerald-500/20">
-            <div className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-            <span className="text-[10px] font-medium text-emerald-400">Stellar Testnet</span>
+          <div className="flex-1 flex flex-col pb-(--nav-h)">
+          {/* Content */}
+          <main className="flex-1 px-2">
+            <Routes>
+              {/* Free pages — no active game check */}
+              <Route path="/" element={<HomeScreen />} />
+              <Route path="/account" element={<ConnectGuard><AccountScreen /></ConnectGuard>} />
+              <Route path="/tutorial" element={<TutorialScreen />} />
+
+              {/* Game room — always accessible */}
+              <Route path="/room/:id" element={<ConnectGuard><GameRoom /></ConnectGuard>} />
+
+              {/* Guarded pages — blocked if active game exists */}
+              <Route path="/how-it-works" element={<ActiveGameGuard><HowItWorksScreen /></ActiveGameGuard>} />
+              <Route path="/play" element={<ConnectGuard><PlayMenu /></ConnectGuard>} />
+              <Route path="/play/create" element={<ConnectGuard><ActiveGameGuard><CreateRoomForm /></ActiveGameGuard></ConnectGuard>} />
+              <Route path="/play/rooms" element={<ConnectGuard><ActiveGameGuard><RoomList /></ActiveGameGuard></ConnectGuard>} />
+
+              <Route path="*" element={<Navigate to="/" />} />
+            </Routes>
+          </main>
           </div>
         </div>
 
-        {/* Content */}
-        <main className="flex-1 px-4 pb-6">
-          {!isConnected ? (
-            <div className="mt-8 p-5 rounded-2xl bg-slate-900/50 border border-slate-800 text-center">
-              <p className="text-sm text-slate-400">Loading account...</p>
-              <div className="w-5 h-5 mx-auto mt-3 border-2 border-cyan-400 border-t-transparent rounded-full animate-spin" />
-            </div>
-          ) : (
-            <>
-              {screen === 'home' && <HomeScreen onNavigate={handleNavigate} />}
-              {screen === 'play' && <PlayScreen initialAction={playAction} />}
-              {screen === 'profile' && (
-                <ProfileScreen
-                  publicKey={publicKey!}
-                  balance={balance}
-                  onFund={fundAccount}
-                  onReset={resetAccount}
-                  onRefreshBalance={refreshBalance}
-                />
-              )}
-            </>
-          )}
-        </main>
+        {/* Bottom nav — fixed height */}
+        <BottomNav />
       </div>
 
-      {/* Bottom Nav */}
-      <BottomNav active={screen} onChange={(s) => handleNavigate(s)} />
-    </div>
+      <Toaster
+        theme="dark"
+        position="top-center"
+        toastOptions={{
+          style: {
+            background: 'oklch(0.157 0.044 264.695)',
+            border: '1px solid oklch(0.306 0.044 264.695)',
+            color: 'oklch(0.985 0.002 247.858)',
+            fontSize: '13px',
+          },
+        }}
+      />
+    </BrowserRouter>
   );
 }

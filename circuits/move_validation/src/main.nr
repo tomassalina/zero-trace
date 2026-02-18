@@ -7,8 +7,9 @@ fn poseidon2_hash(a: Field, b: Field, c: Field) -> Field {
 /// Proves that a player moved to a valid adjacent cell on the 6x6 grid
 /// without revealing either the old or new position.
 ///
-/// The move must be to an adjacent cell (Manhattan distance exactly 1)
-/// and the new cell must not be blocked (previously attacked).
+/// The move must be to an adjacent cell (Chebyshev distance exactly 1,
+/// i.e. like a chess king -- including diagonals) and the new cell must
+/// not be blocked (previously attacked).
 ///
 /// blocked_cells is a flat array: [x0, y0, x1, y1, ...] padded with 255s.
 /// num_blocked tells how many valid (x,y) pairs there are.
@@ -36,11 +37,12 @@ fn main(
     assert(new_x < 6, "new x out of bounds");
     assert(new_y < 6, "new y out of bounds");
 
-    // Must move to adjacent cell (Manhattan distance exactly 1)
+    // Must move to adjacent cell (Chebyshev distance exactly 1 -- king move)
     let dx = if new_x > old_x { new_x - old_x } else { old_x - new_x };
     let dy = if new_y > old_y { new_y - old_y } else { old_y - new_y };
-    let distance = dx + dy;
-    assert(distance == 1, "must move exactly one step");
+    assert(dx <= 1, "must move at most one step in x");
+    assert(dy <= 1, "must move at most one step in y");
+    assert(dx + dy > 0, "must move at least one step");
 
     // New position must not be a blocked cell
     for i in 0..36 {
@@ -85,7 +87,39 @@ fn test_valid_move_up() {
     main(old_x, old_y, old_salt, new_x, new_y, new_salt, old_commitment, new_commitment, blocked, 0);
 }
 
-#[test(should_fail_with = "must move exactly one step")]
+#[test]
+fn test_valid_move_diagonal() {
+    let old_x: u8 = 2;
+    let old_y: u8 = 3;
+    let old_salt: Field = 111;
+    let new_x: u8 = 3;
+    let new_y: u8 = 4;
+    let new_salt: Field = 222;
+
+    let old_commitment = poseidon2_hash(old_x as Field, old_y as Field, old_salt);
+    let new_commitment = poseidon2_hash(new_x as Field, new_y as Field, new_salt);
+
+    let blocked: [u8; 72] = [255; 72];
+    main(old_x, old_y, old_salt, new_x, new_y, new_salt, old_commitment, new_commitment, blocked, 0);
+}
+
+#[test]
+fn test_valid_move_diagonal_down_left() {
+    let old_x: u8 = 2;
+    let old_y: u8 = 3;
+    let old_salt: Field = 111;
+    let new_x: u8 = 1;
+    let new_y: u8 = 2;
+    let new_salt: Field = 444;
+
+    let old_commitment = poseidon2_hash(old_x as Field, old_y as Field, old_salt);
+    let new_commitment = poseidon2_hash(new_x as Field, new_y as Field, new_salt);
+
+    let blocked: [u8; 72] = [255; 72];
+    main(old_x, old_y, old_salt, new_x, new_y, new_salt, old_commitment, new_commitment, blocked, 0);
+}
+
+#[test(should_fail_with = "must move at least one step")]
 fn test_no_move() {
     let old_x: u8 = 2;
     let old_y: u8 = 3;
@@ -101,13 +135,13 @@ fn test_no_move() {
     main(old_x, old_y, old_salt, new_x, new_y, new_salt, old_commitment, new_commitment, blocked, 0);
 }
 
-#[test(should_fail_with = "must move exactly one step")]
-fn test_diagonal_move() {
+#[test(should_fail_with = "must move at most one step")]
+fn test_two_steps() {
     let old_x: u8 = 2;
     let old_y: u8 = 3;
     let old_salt: Field = 111;
-    let new_x: u8 = 3;
-    let new_y: u8 = 4;
+    let new_x: u8 = 4;
+    let new_y: u8 = 3;
     let new_salt: Field = 222;
 
     let old_commitment = poseidon2_hash(old_x as Field, old_y as Field, old_salt);
@@ -133,5 +167,24 @@ fn test_move_to_blocked() {
     let mut blocked: [u8; 72] = [255; 72];
     blocked[0] = 3;
     blocked[1] = 3;
+    main(old_x, old_y, old_salt, new_x, new_y, new_salt, old_commitment, new_commitment, blocked, 1);
+}
+
+#[test(should_fail_with = "cannot move to blocked cell")]
+fn test_diagonal_move_to_blocked() {
+    let old_x: u8 = 2;
+    let old_y: u8 = 3;
+    let old_salt: Field = 111;
+    let new_x: u8 = 3;
+    let new_y: u8 = 4;
+    let new_salt: Field = 222;
+
+    let old_commitment = poseidon2_hash(old_x as Field, old_y as Field, old_salt);
+    let new_commitment = poseidon2_hash(new_x as Field, new_y as Field, new_salt);
+
+    // Block cell (3, 4)
+    let mut blocked: [u8; 72] = [255; 72];
+    blocked[0] = 3;
+    blocked[1] = 4;
     main(old_x, old_y, old_salt, new_x, new_y, new_salt, old_commitment, new_commitment, blocked, 1);
 }

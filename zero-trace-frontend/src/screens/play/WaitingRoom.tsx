@@ -1,31 +1,27 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Copy, Check, Loader2 } from 'lucide-react';
+import { ZeroTraceService } from '@/games/zero-trace/zeroTraceService';
+import { useWallet } from '@/hooks/useWallet';
+import { ZERO_TRACE_CONTRACT } from '@/utils/constants';
+
+const service = new ZeroTraceService(ZERO_TRACE_CONTRACT);
 
 interface Props {
   sessionId: number;
   stake: string;
   isPublic: boolean;
   password: string;
-  onGameFound: () => void;
-  onCancel: () => Promise<void>;
-  checkForGame: () => Promise<boolean>;
 }
 
-export function WaitingRoom({ sessionId, stake, isPublic, password, onGameFound, onCancel, checkForGame }: Props) {
+export function WaitingRoom({ sessionId, stake, isPublic, password }: Props) {
+  const navigate = useNavigate();
+  const { publicKey, getContractSigner } = useWallet();
   const [copied, setCopied] = useState<'id' | 'pw' | null>(null);
   const [cancelling, setCancelling] = useState(false);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  useEffect(() => {
-    pollRef.current = setInterval(async () => {
-      const found = await checkForGame();
-      if (found) onGameFound();
-    }, 3000);
-    return () => { if (pollRef.current) clearInterval(pollRef.current); };
-  }, [checkForGame, onGameFound]);
 
   const copy = (text: string, type: 'id' | 'pw') => {
     navigator.clipboard.writeText(text);
@@ -35,7 +31,13 @@ export function WaitingRoom({ sessionId, stake, isPublic, password, onGameFound,
 
   const handleCancel = async () => {
     setCancelling(true);
-    try { await onCancel(); } finally { setCancelling(false); }
+    try {
+      const signer = getContractSigner();
+      await service.cancelRoom(sessionId, publicKey!, signer);
+      navigate('/play');
+    } catch {
+      setCancelling(false);
+    }
   };
 
   return (

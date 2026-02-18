@@ -1,15 +1,13 @@
+import { useNavigate } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Separator } from '@/components/ui/separator';
-import { Shield, Crosshair, Trophy } from 'lucide-react';
-import type { AppScreen } from '../games/zero-trace/types';
+import { Shield, Crosshair, Trophy, ArrowRight } from 'lucide-react';
 
-interface Props {
-  onNavigate: (screen: AppScreen, playAction?: string) => void;
-}
+export function HomeScreen() {
+  const navigate = useNavigate();
 
-export function HomeScreen({ onNavigate }: Props) {
   return (
     <div className="space-y-6 animate-fade-in pt-4">
       {/* Hero */}
@@ -29,10 +27,10 @@ export function HomeScreen({ onNavigate }: Props) {
 
       {/* CTAs */}
       <div className="space-y-3">
-        <Button className="w-full h-12 text-sm font-bold" onClick={() => onNavigate('play', 'create')}>
+        <Button className="w-full h-12 text-sm font-bold" onClick={() => navigate('/play/create')}>
           Create Room
         </Button>
-        <Button variant="outline" className="w-full h-12 text-sm font-bold" onClick={() => onNavigate('play', 'room-list')}>
+        <Button variant="outline" className="w-full h-12 text-sm font-bold" onClick={() => navigate('/play/rooms')}>
           Browse Rooms
         </Button>
       </div>
@@ -45,7 +43,7 @@ export function HomeScreen({ onNavigate }: Props) {
         <div className="grid grid-cols-3 gap-3">
           {[
             { icon: <Shield size={20} />, title: 'Hide', desc: 'Commit position with ZK proof' },
-            { icon: <Crosshair size={20} />, title: 'Hunt', desc: 'Fire shots, opponent proves hit/miss' },
+            { icon: <Crosshair size={20} />, title: 'Hunt', desc: 'Both fire simultaneously, prove hit/miss' },
             { icon: <Trophy size={20} />, title: 'Win', desc: 'Last standing takes the pot' },
           ].map((item) => (
             <Card key={item.title}>
@@ -57,6 +55,13 @@ export function HomeScreen({ onNavigate }: Props) {
             </Card>
           ))}
         </div>
+        <Button
+          variant="ghost"
+          className="w-full text-xs text-muted-foreground hover:text-primary gap-1"
+          onClick={() => navigate('/how-it-works')}
+        >
+          Learn more <ArrowRight size={12} />
+        </Button>
       </div>
     </div>
   );

@@ -1,17 +1,26 @@
 import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { ArrowLeft, Shuffle } from 'lucide-react';
 import { hashPassword, zeroHash, generateRoomPassword } from '@/utils/password';
+import { useWallet } from '@/hooks/useWallet';
+import { ZeroTraceService } from '@/games/zero-trace/zeroTraceService';
+import { ZERO_TRACE_CONTRACT } from '@/utils/constants';
 
-interface Props {
-  onSubmit: (stake: bigint, isPublic: boolean, passwordHash: Uint8Array, password: string) => Promise<void>;
-  onBack: () => void;
-}
+const service = new ZeroTraceService(ZERO_TRACE_CONTRACT);
 
-export function CreateRoomForm({ onSubmit, onBack }: Props) {
+const createSessionId = (): number => {
+  const buf = new Uint32Array(1);
+  crypto.getRandomValues(buf);
+  return buf[0] || 1;
+};
+
+export function CreateRoomForm() {
+  const navigate = useNavigate();
+  const { publicKey, getContractSigner } = useWallet();
   const [stake, setStake] = useState('50');
   const [isPublic, setIsPublic] = useState(true);
   const [password, setPassword] = useState('');
@@ -28,7 +37,10 @@ export function CreateRoomForm({ onSubmit, onBack }: Props) {
     try {
       const stakeStroops = BigInt(Math.round(stakeNum * 10_000_000));
       const pwHash = isPublic ? zeroHash() : hashPassword(password);
-      await onSubmit(stakeStroops, isPublic, pwHash, password);
+      const sid = createSessionId();
+      const signer = getContractSigner();
+      await service.createRoom(sid, publicKey!, stakeStroops, isPublic, pwHash, signer);
+      navigate(`/room/${sid}`, { state: { stake: stakeNum, password, isPublic } });
     } catch (e: any) {
       setError(e.message || 'Failed to create room');
     } finally {
@@ -39,7 +51,7 @@ export function CreateRoomForm({ onSubmit, onBack }: Props) {
   return (
     <div className="space-y-4 animate-fade-in">
       <div className="flex items-center gap-3">
-        <Button variant="ghost" size="icon" onClick={onBack}><ArrowLeft size={18} /></Button>
+        <Button variant="ghost" size="icon" onClick={() => navigate('/play')}><ArrowLeft size={18} /></Button>
         <h2 className="text-lg font-bold">Create Room</h2>
       </div>
 
@@ -72,12 +84,7 @@ export function CreateRoomForm({ onSubmit, onBack }: Props) {
           <div className="space-y-2">
             <Label>Room Type</Label>
             <div className="grid grid-cols-2 gap-2">
-              <Button
-                variant={isPublic ? 'default' : 'outline'}
-                onClick={() => setIsPublic(true)}
-              >
-                Public
-              </Button>
+              <Button variant={isPublic ? 'default' : 'outline'} onClick={() => setIsPublic(true)}>Public</Button>
               <Button
                 variant={!isPublic ? 'secondary' : 'outline'}
                 onClick={() => { setIsPublic(false); if (!password) handleGenerate(); }}
@@ -91,11 +98,7 @@ export function CreateRoomForm({ onSubmit, onBack }: Props) {
             <div className="space-y-2">
               <Label>Password</Label>
               <div className="flex gap-2">
-                <Input
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder="Enter password"
-                />
+                <Input value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Enter password" />
                 <Button variant="outline" size="icon" onClick={handleGenerate} title="Auto-generate">
                   <Shuffle size={14} />
                 </Button>

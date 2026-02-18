@@ -108,6 +108,21 @@ export class ZeroTraceService {
     console.log('[cancelRoom] success');
   }
 
+  // ======== ACTIVE GAME ========
+
+  async getActiveGame(player: string): Promise<number | null> {
+    try {
+      const tx = await this.baseClient.get_active_game({ player });
+      const result = await tx.simulate();
+      if (result.result !== undefined && result.result !== null) {
+        return result.result as unknown as number | null;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
   // ======== GAME OPERATIONS ========
 
   async getGame(sessionId: number): Promise<any | null> {
@@ -219,7 +234,7 @@ export class ZeroTraceService {
     const tx = await client.respond({
       session_id: sessionId,
       player,
-      hit,
+      was_hit: hit,
       new_commitment: Buffer.from(newCommitmentBytes),
       shot_proof: Buffer.from(dummyProof),
       shot_public_inputs: Buffer.from(dummyProof),

@@ -1,70 +1,115 @@
-import { useCallback, useEffect } from 'react';
+import { useCallback } from 'react';
 import { useWalletStore } from '../store/walletSlice';
-import { accountService } from '../services/accountService';
+import { StellarWalletsKit } from '../lib/walletKit';
 import type { ContractSigner } from '../types/signer';
+import { NETWORK_PASSPHRASE } from '../utils/constants';
 
 export function useWallet() {
-  const { publicKey, isConnected, balance, error, setWallet, setBalance, setError, disconnect } =
+  const { publicKey, isConnected, balance, error, network, setWallet, setBalance, setError, setNetwork, disconnect: storeDisconnect } =
     useWalletStore();
 
-  /** Auto-init account on first call */
-  const initAccount = useCallback(() => {
+  const connect = useCallback(async () => {
     try {
-      const pk = accountService.init();
-      setWallet(pk);
-      return pk;
+      setError(null);
+      const { address } = await StellarWalletsKit.authModal();
+      setWallet(address);
+      // Fetch balance after connecting
+      try {
+        const res = await fetch(
+          `https://horizon-testnet.stellar.org/accounts/${address}`
+        );
+        if (res.ok) {
+          const data = await res.json();
+          const native = data.balances?.find((b: any) => b.asset_type === 'native');
+          setBalance(native?.balance ?? '0');
+        } else {
+          setBalance('0');
+        }
+      } catch {
+        setBalance('0');
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to init account');
-      return null;
+      if (err instanceof Error && err.message.includes('cancel')) return;
+      setError(err instanceof Error ? err.message : 'Failed to connect');
     }
-  }, [setWallet, setError]);
+  }, [setWallet, setBalance, setError]);
 
-  /** Fetch balance from Horizon */
-  const refreshBalance = useCallback(async () => {
+  const disconnect = useCallback(async () => {
     try {
-      const bal = await accountService.getBalance();
+      await StellarWalletsKit.disconnect();
+    } catch {
+      // ignore disconnect errors
+    }
+    storeDisconnect();
+  }, [storeDisconnect]);
+
+  const refreshBalance = useCallback(async () => {
+    if (!publicKey) return null;
+    try {
+      const res = await fetch(
+        `https://horizon-testnet.stellar.org/accounts/${publicKey}`
+      );
+      if (res.status === 404) { setBalance('0'); return '0'; }
+      if (!res.ok) { setBalance(null); return null; }
+      const data = await res.json();
+      const native = data.balances?.find((b: any) => b.asset_type === 'native');
+      const bal = native?.balance ?? '0';
       setBalance(bal);
       return bal;
     } catch {
       setBalance(null);
       return null;
     }
-  }, [setBalance]);
+  }, [publicKey, setBalance]);
 
-  /** Fund via friendbot */
   const fundAccount = useCallback(async () => {
+    if (!publicKey) return;
     try {
       setError(null);
-      await accountService.fund();
+      const res = await fetch(`https://friendbot.stellar.org?addr=${publicKey}`);
+      if (!res.ok) throw new Error(`Friendbot failed (${res.status})`);
       await refreshBalance();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to fund');
     }
-  }, [refreshBalance, setError]);
+  }, [publicKey, refreshBalance, setError]);
 
-  /** Reset account (new keypair) */
-  const resetAccount = useCallback(() => {
-    const pk = accountService.reset();
-    setWallet(pk);
-    setBalance(null);
-  }, [setWallet, setBalance]);
-
-  /** Get signer for contract calls */
   const getContractSigner = useCallback((): ContractSigner => {
-    if (!isConnected) throw new Error('Account not initialized');
-    return accountService.getSigner();
-  }, [isConnected]);
+    if (!isConnected || !publicKey) throw new Error('Wallet not connected');
+    return {
+      signTransaction: async (txXdr: string, opts?: any) => {
+        const result = await StellarWalletsKit.signTransaction(txXdr, {
+          networkPassphrase: opts?.networkPassphrase ?? NETWORK_PASSPHRASE,
+          address: publicKey,
+        });
+        return {
+          signedTxXdr: result.signedTxXdr,
+          signerAddress: result.signerAddress ?? publicKey,
+        };
+      },
+      signAuthEntry: async (preimageXdr: string, opts?: any) => {
+        const result = await StellarWalletsKit.signAuthEntry(preimageXdr, {
+          networkPassphrase: opts?.networkPassphrase ?? NETWORK_PASSPHRASE,
+          address: publicKey,
+        });
+        return {
+          signedAuthEntry: result.signedAuthEntry,
+          signerAddress: result.signerAddress ?? publicKey,
+        };
+      },
+    };
+  }, [isConnected, publicKey]);
 
   return {
     publicKey,
     isConnected,
     balance,
     error,
-    initAccount,
+    network,
+    connect,
+    disconnect,
     refreshBalance,
     fundAccount,
-    resetAccount,
     getContractSigner,
-    disconnect,
   };
 }
